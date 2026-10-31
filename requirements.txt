@@ -1,2 +1,12 @@
 streamlit
 aiohttp
+pandas
+requests
+plotly
+google-generativeai
+feedparser
+beautifulsoup4
+python-dotenv
+google-api-python-client
+tenacity
+lxml
