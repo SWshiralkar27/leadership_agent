@@ -907,40 +907,69 @@ def write_html(digest: Digest, path: Path) -> None:
     path.write_text("".join(out), encoding="utf-8")
 
 # ----------------------------------------------------------------------------
-# Main
+# Main (Streamlit Interface)
 # ----------------------------------------------------------------------------
-async def run_once() -> None:
+import streamlit as st
+import tempfile
+
+async def run_digest_pipeline():
     global model_manager
-    start = time.time()
-    DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
     model_manager = GeminiModelManager(GEMINI_API_KEY or "")
     await asyncio.to_thread(model_manager.get_working_model)
 
     items = await fetch_all_content()
     digest = await asyncio.to_thread(process_content, items)
+    return digest
 
-    stem = DESKTOP_PATH / f"leadership_digest_{digest.date}"
-    write_json(digest, stem.with_suffix(".json"))
-    write_markdown(digest, stem.with_suffix(".md"))
-    write_html(digest, stem.with_suffix(".html"))
-    logging.info("Digest generation complete in %.0f s -> %s", time.time() - start, DESKTOP_PATH)
-    try:
-        webbrowser.open(stem.with_suffix(".html").resolve().as_uri())
-    except Exception:
-        pass
+def main_streamlit():
+    st.set_page_config(page_title="Leadership AI Daily Digest", layout="centered")
+    st.title("🚀 Leadership AI Daily Digest Generator")
+    st.markdown("Click the button below to fetch the latest content across platforms, score them, and generate custom human-in-the-loop comments.")
 
+    if st.button("Generate Digest", type="primary"):
+        with st.spinner("Fetching content and generating comments via Gemini... (this may take a minute)"):
+            try:
+                # Run the async pipeline inside Streamlit
+                digest = asyncio.run(run_digest_pipeline())
+                
+                st.success("Digest generated successfully!")
+                st.info(digest.summary)
+                
+                # Create temporary files for downloading
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = Path(tmpdir) / f"leadership_digest_{digest.date}"
+                    
+                    # Write files
+                    write_json(digest, tmp_path.with_suffix(".json"))
+                    write_markdown(digest, tmp_path.with_suffix(".md"))
+                    write_html(digest, tmp_path.with_suffix(".html"))
+                    
+                    # Read files for download buttons
+                    json_data = tmp_path.with_suffix(".json").read_text(encoding="utf-8")
+                    md_data = tmp_path.with_suffix(".md").read_text(encoding="utf-8")
+                    html_data = tmp_path.with_suffix(".html").read_text(encoding="utf-8")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.download_button("Download JSON", json_data, file_name=f"leadership_digest_{digest.date}.json", mime="application/json")
+                    with col2:
+                        st.download_button("Download Markdown", md_data, file_name=f"leadership_digest_{digest.date}.md", mime="text/markdown")
+                    with col3:
+                        st.download_button("Download HTML", html_data, file_name=f"leadership_digest_{digest.date}.html", mime="text/html")
 
-async def main() -> None:
-    if RUN_ONCE:
-        await run_once()
-        return
-    while True:
-        try:
-            await run_once()
-        except Exception as ex:
-            logging.exception("Run failed: %s", ex)
-        await asyncio.sleep(RUN_INTERVAL_HOURS * 3600)
-
+                # Display items segregated by platform on the UI
+                for platform, its in digest.items_by_platform.items():
+                    st.subheader(f"{PLATFORM_ICON.get(platform, '')} {PLATFORM_LABEL.get(platform, platform)} ({len(its)})")
+                    for n, it in enumerate(its, 1):
+                        with st.expander(f"Post {n}: {it.title}"):
+                            st.markdown(f"**Source:** {it.source} | **Published:** {it.published} | **Score:** {it.relevance_score}")
+                            st.markdown(f"[Link to Original Post]({it.url})")
+                            st.markdown(f"**Snippet:** {it.snippet}")
+                            st.markdown(f"**Generated Comment:**")
+                            st.markdown(f"> {it.comment}")
+            
+            except Exception as ex:
+                st.exception(f"An error occurred during digest generation: {ex}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main_streamlit()
