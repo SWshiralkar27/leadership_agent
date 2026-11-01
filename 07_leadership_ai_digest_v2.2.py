@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import tempfile
 import html
 import json
 import logging
@@ -69,7 +70,8 @@ RUN_ONCE = os.getenv("RUN_ONCE", "true").lower() in ("1", "true", "yes")
 RUN_INTERVAL_HOURS = float(os.getenv("RUN_INTERVAL_HOURS", "24"))
 INCLUDE_INSTAGRAM = os.getenv("INCLUDE_INSTAGRAM", "false").lower() in ("1", "true", "yes")
 ENABLE_SCRAPE_FALLBACK = os.getenv("ENABLE_SCRAPE_FALLBACK", "false").lower() in ("1", "true", "yes")
-GEMINI_DELAY_SECONDS = float(os.getenv("GEMINI_DELAY_SECONDS", "1.5"))
+GEMINI_DELAY_SECONDS = float(os.getenv("GEMINI_DELAY_SECONDS", "5"))  # free tier is ~15 requests/min or less
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()  # pin a model, e.g. gemini-2.5-flash
 # Empty = use 70-90 words everywhere. Example: SHORT_FORM_WORDS=40-55
 SHORT_FORM_WORDS = os.getenv("SHORT_FORM_WORDS", "").strip()
 SHORTS_MAX_SECONDS = int(os.getenv("SHORTS_MAX_SECONDS", "60"))  # Shorts can run up to 3 min
@@ -645,6 +647,7 @@ class GeminiModelManager:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.model_name: Optional[str] = None
+        self.no_thinking: set = set()  # models that rejected thinkingConfig (remembered)
 
     def _headers(self) -> dict:
         return {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
@@ -706,11 +709,19 @@ class GeminiModelManager:
 
     def test_model(self, name: str) -> bool:
         try:
-            status, data = self._post(name, "Say 'test'", 10, self._model_uses_thinking_budget(name))
-            if status == 400 and self._model_uses_thinking_budget(name):
+            uses = self._model_uses_thinking_budget(name)
+            status, data = self._post(name, "Say 'test'", 10, uses)
+            if status == 400 and uses:
                 status, data = self._post(name, "Say 'test'", 10, False)
-            return status == 200 and bool(data.get("candidates"))
-        except Exception:
+                if status == 200:
+                    self.no_thinking.add(name)
+            ok = status == 200 and bool(data.get("candidates"))
+            if not ok:
+                logging.warning("Model test failed for %s: HTTP %s %s", name, status,
+                                str((data.get("error") or {}).get("message", ""))[:150])
+            return ok
+        except Exception as ex:
+            logging.warning("Model test error for %s: %s", name, ex)
             return False
 
     def get_working_model(self) -> Optional[str]:
@@ -718,6 +729,8 @@ class GeminiModelManager:
             logging.warning("GEMINI_API_KEY not set - fallback comments will be used.")
             return None
         candidates: List[str] = []
+        if GEMINI_MODEL:
+            candidates.append(GEMINI_MODEL)
         cached = self._get_cached_model()
         if cached:
             candidates.append(cached)
@@ -735,7 +748,7 @@ class GeminiModelManager:
     def generate_content(self, prompt: str, max_tokens: int = 800) -> Optional[dict]:
         if not self.model_name:
             return None
-        use_thinking = self._model_uses_thinking_budget(self.model_name)
+        use_thinking = self._model_uses_thinking_budget(self.model_name) and self.model_name not in self.no_thinking
         for attempt in range(4):
             try:
                 status, data = self._post(self.model_name, prompt, max_tokens, use_thinking)
@@ -744,11 +757,23 @@ class GeminiModelManager:
                 time.sleep(2 ** attempt)
                 continue
             if status == 400 and use_thinking:
-                logging.warning("thinkingConfig rejected by API; retrying without it")
+                logging.warning("thinkingConfig rejected by %s; retrying without it (remembered for this model)", self.model_name)
+                self.no_thinking.add(self.model_name)
                 use_thinking = False
                 continue
             if status in (429, 500, 503):
-                time.sleep(2 ** attempt * 2)
+                blob = json.dumps(data)
+                if status == 429 and "PerDay" in blob:
+                    logging.error("Gemini DAILY quota exhausted for %s. Wait for the reset, pin another model "
+                                  "(GEMINI_MODEL) or enable billing.", self.model_name)
+                    return None
+                wait = 2 ** attempt * 2
+                m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', blob)
+                if m:
+                    wait = min(float(m.group(1)) + 1, 70)
+                logging.warning("Gemini HTTP %s on %s (attempt %d/4): %s - waiting %.0fs", status, self.model_name,
+                                attempt + 1, str((data.get("error") or {}).get("message", ""))[:160], wait)
+                time.sleep(wait)
                 continue
             if status != 200:
                 logging.error("Gemini HTTP %s: %s", status, str(data)[:200])
@@ -864,6 +889,8 @@ Output ONLY the comment text."""
         if res and len(res["text"]) > 50 and not res["truncated"]:  # invariant 3
             draft = res["text"]
             break
+        if res is None:
+            break  # HTTP-level failure (already retried); a bigger token budget will not help
         if res:
             logging.warning("Comment truncated/empty (finishReason=%s); retrying with a larger budget",
                             res["finish_reason"])
@@ -1171,8 +1198,25 @@ async def run_digest_pipeline() -> Digest:
     return await asyncio.to_thread(process_content, items)
 
 
+LAST_RESULT_FILE = Path(tempfile.gettempdir()) / "leadership_last_result.json"
+
+
+def _save_last_result(result: dict) -> None:
+    try:
+        result = dict(result, saved_at=datetime.now().isoformat(timespec="seconds"))
+        LAST_RESULT_FILE.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    except Exception as ex:
+        logging.warning("Could not save last result: %s", ex)
+
+
+def _load_last_result() -> Optional[dict]:
+    try:
+        return json.loads(LAST_RESULT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def main_streamlit() -> None:
-    import tempfile
     import streamlit as st
     import streamlit.components.v1 as components
 
@@ -1199,8 +1243,6 @@ def main_streamlit() -> None:
                 if not GEMINI_API_KEY:
                     st.warning("GEMINI_API_KEY is not set: template fallback comments will be used.")
                 digest = asyncio.run(run_digest_pipeline())
-                if model_manager is not None and not model_manager.model_name:
-                    st.warning("No working Gemini model was found: comments are fallback templates. Check the key.")
                 save_history(digest)
                 with tempfile.TemporaryDirectory() as tmp:
                     stem = Path(tmp) / f"leadership_digest_{digest.date}"
@@ -1209,8 +1251,11 @@ def main_streamlit() -> None:
                     write_html(digest, Path(f"{stem}.html"))
                     files = {ext: Path(f"{stem}.{ext}").read_text(encoding="utf-8") for ext in ("json", "md", "html")}
                 files["history"] = HISTORY_FILE.read_text(encoding="utf-8") if HISTORY_FILE.exists() else ""
-                # Streamlit reruns the script on every click, so keep the result in session_state
-                st.session_state["result"] = {"summary": digest.summary, "date": digest.date, "files": files}
+                result = {"summary": digest.summary, "date": digest.date, "files": files}
+                _save_last_result(result)  # saved BEFORE any UI call, so it survives a dropped browser session
+                st.session_state["result"] = result
+                if model_manager is not None and not model_manager.model_name:
+                    st.warning("No working Gemini model was found: comments are fallback templates. Check the key, quota or GEMINI_MODEL.")
                 status.update(label="Digest ready", state="complete")
         except Exception as ex:
             st.error(f"An error occurred during digest generation: {ex}")
@@ -1218,8 +1263,11 @@ def main_streamlit() -> None:
 
     res = st.session_state.get("result")
     if not res:
-        st.info("Click Generate Digest to start.")
-        return
+        res = _load_last_result()
+        if not res:
+            st.info("Click Generate Digest to start.")
+            return
+        st.info(f"Showing the last saved digest ({res.get('date')}, saved {res.get('saved_at', '')}). Click Generate Digest for a new one.")
     f, d = res["files"], res["date"]
     st.success(res["summary"])
     c1, c2, c3, c4 = st.columns(4)
