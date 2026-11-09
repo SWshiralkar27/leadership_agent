@@ -853,4 +853,214 @@ background:#f5f6f8;color:#202733;margin:0}
 .card{background:white;border:1px solid #dfe3e8;border-radius:10px;padding:18px;margin:16px 0}
 .meta,.muted{color:#667085;font-size:13px}
 .reason{margin:8px 0}
+.pill{display:inline-block;border-radius:20px;padding:3px 10px;font-size:12px;
+font-weight:600;background:#e5e7eb}
+.pill.A_PROMOTE{background:#dcfce7;color:#166534}
+.pill.B_ENGAGE{background:#dbeafe;color:#1e40af}
+.pill.C_SENSITIVE{background:#fee2e2;color:#991b1b}
+.pill.D_SKIP{background:#e5e7eb;color:#374151}
+.draft{border-left:3px solid #d6a23a;padding:10px 14px;margin:12px 0;background:#fafafa;
+border-radius:0 6px 6px 0}
+button{border:0;border-radius:6px;padding:7px 12px;background:#1d4ed8;color:white;
+cursor:pointer;margin:6px 4px 0 0;font-size:13px}
+button:hover{background:#1e40af}
+a{color:#1d4ed8;text-decoration:none}a:hover{text-decoration:underline}
+h1{margin:0 0 4px}h2{margin:24px 0 4px}
+.component{display:inline-block;margin-right:12px;font-size:12px;color:#475467}
+"""
+
+
+def write_html(digest: Digest, path: Path) -> None:
+    esc = lambda s: html.escape(str(s or ""), quote=True)  # noqa: E731
+
+    parts: list[str] = [
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        f"<title>Leadership AI Digest — {esc(digest.date)}</title>",
+        f"<style>{_HTML_CSS}</style></head><body><div class='wrap'>",
+        "<h1>Leadership AI Daily Digest</h1>",
+        f"<div class='meta'>{esc(digest.date)} · {digest.total_items} candidates · "
+        f"v{esc(digest.version)} · prompt {esc(digest.prompt_version)}</div>",
+        f"<p>{esc(digest.summary)}</p>",
+        "<p class='muted'><b>Human review required.</b> A decision is a "
+        "recommendation, not an instruction to publish. Read the source post "
+        "and edit every draft before posting.</p>",
+    ]
+
+    for platform, items in digest.items_by_platform.items():
+        parts.append(
+            f"<h2>{esc(PLATFORM_ICON.get(platform, ''))} "
+            f"{esc(PLATFORM_LABEL.get(platform, platform))}</h2>")
+
+        for n, it in enumerate(items, 1):
+            parts.append("<section class='card'>")
+            parts.append(
+                f"<div class='meta'>Post {n} · discovery {it.relevance_score:.2f}</div>")
+            parts.append(
+                f"<h3><a href='{esc(it.url)}' target='_blank' rel='noopener'>"
+                f"{esc(it.title)}</a></h3>")
+            parts.append(
+                f"<div class='meta'>{esc(it.source)} · {esc(it.published)}</div>")
+
+            parts.append(
+                f"<p><span class='pill {esc(it.decision.value)}'>"
+                f"{esc(it.decision.value)}</span> "
+                f"<span class='meta'>Sensitivity: {esc(it.sensitivity.value)} · "
+                f"Confidence: {esc(it.confidence.value)} · "
+                f"Promotion score: {it.promotion_score}/100</span></p>")
+
+            parts.append(f"<p class='reason'><b>Why:</b> {esc(it.decision_reason)}</p>")
+            if it.sensitivity_reason:
+                parts.append(
+                    f"<p class='muted'><b>Sensitivity reason:</b> "
+                    f"{esc(it.sensitivity_reason)}</p>")
+            if it.context_summary:
+                parts.append(
+                    f"<p class='muted'><b>Context:</b> "
+                    f"{esc(it.context_summary)}</p>")
+            if it.book_theme:
+                parts.append(
+                    f"<p class='muted'><b>Theme:</b> {esc(it.book_theme)}</p>")
+
+            parts.append(
+                "<div class='meta'>"
+                f"<span class='component'>Book {it.book_alignment_score}</span>"
+                f"<span class='component'>Context {it.contextual_relevance_score}</span>"
+                f"<span class='component'>Engagement {it.engagement_score}</span>"
+                f"<span class='component'>Audience {it.audience_alignment_score}</span>"
+                f"<span class='component'>Naturalness "
+                f"{it.promotion_naturalness_score}</span>"
+                "</div>")
+
+            if it.rejection_reason:
+                parts.append(
+                    f"<p class='muted'><b>Notes:</b> "
+                    f"{esc(it.rejection_reason)}</p>")
+
+            if it.comment:
+                drafts = [("Recommended", it.comment)] + [
+                    (f"Alternative {i}", d)
+                    for i, d in enumerate(it.alternatives, 1)]
+                for label, draft in drafts:
+                    draft_id = f"draft-{n}-{hash(draft) & 0xffff:x}"
+                    parts.append(
+                        "<div class='draft'>"
+                        f"<b>{esc(label)}</b>"
+                        f"<p id='{draft_id}'>{_draft_html(draft, it.platform)}</p>"
+                        f"<button type='button' "
+                        f"data-copy='{draft_id}'>Copy draft</button>"
+                        "</div>")
+            else:
+                parts.append(
+                    "<p class='muted'><b>No draft generated.</b> "
+                    "This is intentional for sensitive, weak-fit, "
+                    "low-confidence, or failed-analysis items.</p>")
+
+            parts.append("</section>")
+
+    parts.append("""
+<script>
+document.querySelectorAll("button[data-copy]").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    var el = document.getElementById(btn.getAttribute("data-copy"));
+    if (!el) return;
+    var text = el.innerText || el.textContent || "";
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function(){
+        btn.textContent = "Copied";
+        setTimeout(function(){ btn.textContent = "Copy draft"; }, 1500);
+      });
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch(e) {}
+      document.body.removeChild(ta);
+      btn.textContent = "Copied";
+      setTimeout(function(){ btn.textContent = "Copy draft"; }, 1500);
+    }
+  });
+});
+</script>""")
+
+    parts.append(
+        f"<footer><p class='muted'>Book: "
+        f"<a href='{esc(BOOK_URL)}' target='_blank' rel='noopener'>"
+        f"{esc(BOOK_FULL_TITLE)}</a></p></footer>")
+    parts.append("</div></body></html>")
+
+    path.write_text("".join(parts), encoding="utf-8")
+
+
+def _draft_html(draft: str, platform: str) -> str:
+    """Render draft safely. Markdown links stay as-is on non-plain platforms."""
+    esc = html.escape(draft, quote=False)
+    if platform in PLAIN_TEXT_PLATFORMS:
+        return esc.replace("\n", "<br>")
+    # Lightweight markdown: [text](url) and **bold** only
+    esc = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        r"<a href='\2' target='_blank' rel='noopener'>\1</a>",
+        esc,
+    )
+    esc = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", esc)
+    return esc.replace("\n", "<br>")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _load_items_from_json(path: str) -> list[ContentItem]:
+    """Load a JSON array of posts for testing offline."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Input JSON must be a list of post objects.")
+    items: list[ContentItem] = []
+    for row in data:
+        items.append(ContentItem(
+            platform=row.get("platform", "LinkedIn"),
+            title=row.get("title", ""),
+            url=row.get("url", ""),
+            source=row.get("source", ""),
+            published=row.get("published", ""),
+            snippet=row.get("snippet", ""),
+            full_content=row.get("full_content", row.get("snippet", "")),
+        ))
+    return items
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Leadership AI Daily Digest v3.0")
+    ap.add_argument("--input", help="JSON file of posts (offline mode)")
+    ap.add_argument("--out", default=".", help="Output directory")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="Print config and exit")
+    args = ap.parse_args(argv)
+
+    if args.diagnose:
+        print(f"version={VERSION} prompt={PROMPT_VERSION}")
+        print(f"gemini_model={GEMINI_MODEL} key_set={bool(GEMINI_API_KEY)}")
+        print(f"thresholds: promote={PROMOTION_THRESHOLD} engage={ENGAGEMENT_THRESHOLD}")
+        print(f"min_context={MIN_CONTEXT_CHARS} max_context={MAX_CONTEXT_CHARS}")
+        print(f"history_file={HISTORY_FILE} history_days={HISTORY_DAYS}")
+        print(f"prompts_dir={PROMPTS_DIR}")
+        for name in ("v3_analysis.md", "v3_draft_promote.md", "v3_draft_engage.md"):
+            exists = (PROMPTS_DIR / name).exists()
+            print(f"prompt[{name}]={'OK' if exists else 'MISSING'}")
+        return 0
+
+    if not args.input:
+        log.error("No --input supplied. Use --diagnose for config check, "
+                  "or wire a discovery module and pass a ContentItem list.")
+        return 2
+
+    items = _load_items_from_json(args.input)
+    run_digest(items, out_dir=Path(args.out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+.card{background:white;border:1px solid #dfe3e8;border-radius:10px;padding:18px;margin:16px 0}
+.meta,.muted{color:#667085;font-size:13px}
+.reason{margin:8px 0}
 .pill{display:inline-block;border-radius:20px;padding:
