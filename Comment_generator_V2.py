@@ -29,6 +29,19 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Streamlit Cloud Secrets → environment
+try:
+    import streamlit as _st
+    for _k, _v in _st.secrets.items():
+        os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass
 except ImportError:
     pass
 
@@ -1007,56 +1020,202 @@ def _draft_html(draft: str, platform: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Streamlit UI
 # ---------------------------------------------------------------------------
-def _load_items_from_json(path: str) -> list[ContentItem]:
-    """Load a JSON array of posts for testing offline."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise ValueError("Input JSON must be a list of post objects.")
-    items: list[ContentItem] = []
-    for row in data:
-        items.append(ContentItem(
-            platform=row.get("platform", "LinkedIn"),
-            title=row.get("title", ""),
-            url=row.get("url", ""),
-            source=row.get("source", ""),
-            published=row.get("published", ""),
-            snippet=row.get("snippet", ""),
-            full_content=row.get("full_content", row.get("snippet", "")),
-        ))
-    return items
+def _streamlit_app() -> None:
+    import streamlit as st
+
+    st.set_page_config(page_title="Leadership AI Digest v3.0", layout="wide")
+    st.title("Leadership AI Daily Digest v3.0")
+    st.caption(
+        "Analysis-first. Drafts only for A_PROMOTE and B_ENGAGE. "
+        "You review and publish manually."
+    )
+
+    with st.sidebar:
+        st.subheader("Config")
+        st.write(f"**Model:** `{GEMINI_MODEL}`")
+        st.write(f"**Gemini key set:** {'✅' if GEMINI_API_KEY else '❌ MISSING'}")
+        st.write(f"**Promote ≥** {PROMOTION_THRESHOLD} · "
+                 f"**Engage ≥** {ENGAGEMENT_THRESHOLD}")
+        st.write(f"**Min context:** {MIN_CONTEXT_CHARS} chars")
+
+        history_upload = st.file_uploader(
+            "History file (optional, from a previous run)",
+            type=["txt"],
+            help="Upload the seen_posts.txt you downloaded last time.",
+        )
+        if history_upload is not None:
+            try:
+                HISTORY_FILE.write_text(
+                    history_upload.read().decode("utf-8", errors="replace"),
+                    encoding="utf-8",
+                )
+                st.success("History loaded.")
+            except OSError as exc:
+                st.warning(f"Could not persist history: {exc}")
+
+        ignore_history = st.checkbox("Ignore history this run", value=False)
+
+    uploaded = st.file_uploader(
+        "Posts JSON — array of {platform, title, url, snippet/full_content}",
+        type=["json"],
+    )
+    if uploaded is None:
+        st.info(
+            "Upload a posts JSON to run the digest. "
+            "Each item needs at minimum `platform`, `title`, `url`, and either "
+            "`snippet` or `full_content`."
+        )
+        return
+
+    try:
+        rows = json.loads(uploaded.read().decode("utf-8", errors="replace"))
+        if not isinstance(rows, list):
+            st.error("JSON must be an array of post objects.")
+            return
+        content_items = [
+            ContentItem(
+                platform=str(r.get("platform", "LinkedIn")),
+                title=str(r.get("title", "")),
+                url=str(r.get("url", "")),
+                source=str(r.get("source", "")),
+                published=str(r.get("published", "")),
+                snippet=str(r.get("snippet", "")),
+                full_content=str(r.get("full_content", r.get("snippet", ""))),
+            )
+            for r in rows
+        ]
+    except Exception as exc:
+        st.error(f"Could not parse JSON: {exc}")
+        return
+
+    if not GEMINI_API_KEY:
+        st.error(
+            "GEMINI_API_KEY is not set. Add it in Streamlit Cloud → "
+            "Settings → Secrets as `GEMINI_API_KEY = \"...\"`, then reboot."
+        )
+        return
+
+    if not st.button("Run digest", type="primary"):
+        return
+
+    if ignore_history:
+        globals()["IGNORE_HISTORY"] = True
+
+    history = load_history()
+    unique = dedupe_and_filter(content_items, history)
+    selected = select_candidates(unique)
+
+    if not selected:
+        st.warning("No candidates passed the discovery filter. "
+                   "Check relevance_threshold or add more substantial posts.")
+        return
+
+    try:
+        client = GeminiClient(GEMINI_API_KEY, GEMINI_MODEL)
+    except GeminiUnavailable as exc:
+        st.error(f"Gemini unavailable: {exc}")
+        return
+
+    progress = st.progress(0.0, text="Starting…")
+    status = st.empty()
+    total = len(selected)
+
+    for i, item in enumerate(selected, 1):
+        status.write(f"[{i}/{total}] {item.platform} — {item.title[:70]}")
+        analysis = analyse_post(client, item)
+        if analysis is None:
+            item.decision = Decision.D_SKIP
+            item.decision_reason = item.analysis_error or "Analysis failed."
+            item.confidence = Confidence.LOW
+        else:
+            item.decision = Decision(analysis["decision"])
+            item.decision_reason = analysis["decision_reason"]
+            item.context_summary = analysis["context_summary"]
+            item.sensitivity = Sensitivity(analysis["sensitivity"])
+            item.sensitivity_reason = analysis["sensitivity_reason"]
+            item.confidence = Confidence(analysis["confidence"])
+            item.book_theme = analysis["book_theme"]
+            item.promotion_justification = analysis["promotion_justification"]
+            item.book_alignment_score = analysis["book_alignment_score"]
+            item.contextual_relevance_score = analysis["contextual_relevance_score"]
+            item.engagement_score = analysis["engagement_score"]
+            item.audience_alignment_score = analysis["audience_alignment_score"]
+            item.promotion_naturalness_score = analysis["promotion_naturalness_score"]
+            item.promotion_score = analysis["promotion_score"]
+            if analysis.get("guardrail_override"):
+                item.rejection_reason = analysis["guardrail_override"]
+            if item.decision in (Decision.A_PROMOTE, Decision.B_ENGAGE):
+                generate_drafts(client, item)
+        progress.progress(i / total, text=f"{i}/{total}")
+        time.sleep(min(GEMINI_DELAY_SECONDS, 1.0))
+
+    import tempfile
+    out_dir = Path(tempfile.mkdtemp(prefix="digest_"))
+
+    grouped: dict[str, list[ContentItem]] = {}
+    for p in PLATFORM_ORDER:
+        grp = [x for x in selected if x.platform == p]
+        if grp:
+            grp.sort(key=lambda x: _parse_date(x.published), reverse=True)
+            grouped[p] = grp
+
+    counts = {d.value: sum(1 for x in selected if x.decision == d)
+              for d in Decision}
+    summary = (
+        f"{len(selected)} candidate(s): "
+        f"{counts['A_PROMOTE']} promote · {counts['B_ENGAGE']} engage · "
+        f"{counts['C_SENSITIVE']} sensitive · {counts['D_SKIP']} skip."
+    )
+    digest = Digest(
+        date=datetime.now().strftime("%Y-%m-%d"),
+        total_items=len(selected),
+        items_by_platform=grouped,
+        summary=summary,
+        generated_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_path = out_dir / f"digest_{stamp}.html"
+    md_path = out_dir / f"digest_{stamp}.md"
+    json_path = out_dir / f"digest_{stamp}.json"
+    write_html(digest, html_path)
+    write_markdown(digest, md_path)
+    write_json(digest, json_path)
+    save_history(x.url for x in selected)
+
+    status.success(f"Done — {summary}")
+    st.subheader("Download")
+    c1, c2, c3 = st.columns(3)
+    c1.download_button("HTML", html_path.read_bytes(),
+                       file_name=html_path.name, mime="text/html")
+    c2.download_button("Markdown", md_path.read_bytes(),
+                       file_name=md_path.name, mime="text/markdown")
+    c3.download_button("JSON", json_path.read_bytes(),
+                       file_name=json_path.name, mime="application/json")
+
+    st.subheader("Preview")
+    st.components.v1.html(html_path.read_text(encoding="utf-8"),
+                          height=900, scrolling=True)
+
+    if HISTORY_FILE.exists():
+        st.download_button(
+            "Download seen_posts.txt (keep for next run)",
+            HISTORY_FILE.read_bytes(),
+            file_name="seen_posts.txt", mime="text/plain",
+        )
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Leadership AI Daily Digest v3.0")
-    ap.add_argument("--input", help="JSON file of posts (offline mode)")
-    ap.add_argument("--out", default=".", help="Output directory")
-    ap.add_argument("--diagnose", action="store_true",
-                    help="Print config and exit")
-    args = ap.parse_args(argv)
+# ---------------------------------------------------------------------------
+# Entry point — Streamlit when hosted, CLI otherwise
+# ---------------------------------------------------------------------------
+try:
+    import streamlit as st
+    if st.runtime.exists():
+        _streamlit_app()
+except ImportError:
+    pass
 
-    if args.diagnose:
-        print(f"version={VERSION} prompt={PROMPT_VERSION}")
-        print(f"gemini_model={GEMINI_MODEL} key_set={bool(GEMINI_API_KEY)}")
-        print(f"thresholds: promote={PROMOTION_THRESHOLD} engage={ENGAGEMENT_THRESHOLD}")
-        print(f"min_context={MIN_CONTEXT_CHARS} max_context={MAX_CONTEXT_CHARS}")
-        print(f"history_file={HISTORY_FILE} history_days={HISTORY_DAYS}")
-        print(f"prompts_dir={PROMPTS_DIR}")
-        for name in ("v3_analysis.md", "v3_draft_promote.md", "v3_draft_engage.md"):
-            exists = (PROMPTS_DIR / name).exists()
-            print(f"prompt[{name}]={'OK' if exists else 'MISSING'}")
-        return 0
-
-    if not args.input:
-        log.error("No --input supplied. Use --diagnose for config check, "
-                  "or wire a discovery module and pass a ContentItem list.")
-        return 2
-
-    items = _load_items_from_json(args.input)
-    run_digest(items, out_dir=Path(args.out))
-    return 0
-
-
-if __name__ == "__main__":
+if __name__ == "__main__" and "streamlit" not in sys.modules:
     sys.exit(main())
