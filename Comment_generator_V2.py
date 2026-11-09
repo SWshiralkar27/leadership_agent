@@ -1060,7 +1060,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-.card{background:white;border:1px solid #dfe3e8;border-radius:10px;padding:18px;margin:16px 0}
-.meta,.muted{color:#667085;font-size:13px}
-.reason{margin:8px 0}
-.pill{display:inline-block;border-radius:20px;padding:
