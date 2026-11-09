@@ -586,4 +586,83 @@ def main_streamlit() -> None:
 
         if not selected:
             st.warning("No candidates passed the relevance filter.")
-           
+            return
+
+        try:
+            client = GeminiClient(GEMINI_API_KEY, GEMINI_MODEL)
+        except GeminiUnavailable as exc:
+            st.error(f"Gemini error: {exc}")
+            return
+
+        progress = st.progress(0.0, text="Analysing posts...")
+        for i, item in enumerate(selected, 1):
+            analysis = analyse_post(client, item)
+            if not analysis:
+                item.decision, item.decision_reason = Decision.D_SKIP, item.analysis_error or "Analysis failed."
+            else:
+                item.decision = Decision(analysis["decision"])
+                item.decision_reason = analysis["decision_reason"]
+                item.context_summary = analysis["context_summary"]
+                item.sensitivity = Sensitivity(analysis["sensitivity"])
+                item.sensitivity_reason = analysis["sensitivity_reason"]
+                item.confidence = Confidence(analysis["confidence"])
+                item.book_theme = analysis["book_theme"]
+                item.promotion_justification = analysis["promotion_justification"]
+                item.book_alignment_score = analysis["book_alignment_score"]
+                item.contextual_relevance_score = analysis["contextual_relevance_score"]
+                item.engagement_score = analysis["engagement_score"]
+                item.audience_alignment_score = analysis["audience_alignment_score"]
+                item.promotion_naturalness_score = analysis["promotion_naturalness_score"]
+                item.promotion_score = analysis["promotion_score"]
+                if analysis.get("guardrail_override"): item.rejection_reason = analysis["guardrail_override"]
+                
+                if item.decision in (Decision.A_PROMOTE, Decision.B_ENGAGE):
+                    time.sleep(min(GEMINI_DELAY_SECONDS, 1.0))
+                    generate_drafts(client, item)
+            
+            progress.progress(i / len(selected), text=f"[{i}/{len(selected)}] {item.platform} — {item.title[:40]}")
+            time.sleep(min(GEMINI_DELAY_SECONDS, 1.0))
+
+        # Group for export
+        grouped = {}
+        for p in PLATFORM_ORDER:
+            grp = [x for x in selected if x.platform == p]
+            if grp: grouped[p] = grp
+        counts = {d.value: sum(1 for x in selected if x.decision == d) for d in Decision}
+        summary = f"{len(selected)} assessed: {counts['A_PROMOTE']} promote · {counts['B_ENGAGE']} engage · {counts['C_SENSITIVE']} sensitive · {counts['D_SKIP']} skip."
+        
+        digest = Digest(datetime.now().strftime("%Y-%m-%d"), len(selected), grouped, summary, datetime.now().isoformat(timespec="seconds"))
+        
+        import tempfile
+        out_dir = Path(tempfile.mkdtemp())
+        html_path, md_path, json_path = out_dir / "digest.html", out_dir / "digest.md", out_dir / "digest.json"
+        write_html(digest, html_path)
+        write_markdown(digest, md_path)
+        write_json(digest, json_path)
+        save_history(x.url for x in selected)
+
+        st.success(f"Done! {summary}")
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("Download HTML", html_path.read_bytes(), "digest.html", "text/html")
+        c2.download_button("Download Markdown", md_path.read_bytes(), "digest.md", "text/markdown")
+        c3.download_button("Download JSON", json_path.read_bytes(), "digest.json", "application/json")
+        
+        st.download_button("Download seen_posts.txt", HISTORY_FILE.read_bytes() if HISTORY_FILE.exists() else b"", "seen_posts.txt")
+        
+        st.subheader("Preview")
+        st.components.v1.html(html_path.read_text(encoding="utf-8"), height=900, scrolling=True)
+
+# ---------------------------------------------------------------------------
+# CLI Entry Point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--diagnose", action="store_true")
+    args = ap.parse_args()
+    if args.diagnose:
+        print(f"version={VERSION} | model={GEMINI_MODEL} | provider={SEARCH_PROVIDER}")
+        return
+    print("Run this app via: streamlit run Comment_generator_V2.py")
+
+if __name__ == "__main__" and "streamlit" not in sys.modules:
+    main()
