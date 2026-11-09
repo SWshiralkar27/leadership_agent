@@ -29,9 +29,6 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    try:
-    from dotenv import load_dotenv
-    load_dotenv()
 except ImportError:
     pass
 
@@ -41,8 +38,6 @@ try:
     for _k, _v in _st.secrets.items():
         os.environ.setdefault(_k, str(_v))
 except Exception:
-    pass
-except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
