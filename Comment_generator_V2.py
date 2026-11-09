@@ -641,16 +641,28 @@ def main_streamlit() -> None:
         write_json(digest, json_path)
         save_history(x.url for x in selected)
 
-        st.success(f"Done! {summary}")
-        c1, c2, c3 = st.columns(3)
-        c1.download_button("Download HTML", html_path.read_bytes(), "digest.html", "text/html")
-        c2.download_button("Download Markdown", md_path.read_bytes(), "digest.md", "text/markdown")
-        c3.download_button("Download JSON", json_path.read_bytes(), "digest.json", "application/json")
+        st.session_state["result"] = {
+            "summary": summary,
+            "html": html_path.read_text(encoding="utf-8"),
+            "md": md_path.read_text(encoding="utf-8"),
+            "json": json_path.read_text(encoding="utf-8"),
+            "history": HISTORY_FILE.read_bytes() if HISTORY_FILE.exists() else b""
+        }
+
+    # --- Display the results (this runs on every page load if results exist) ---
+    if "result" in st.session_state:
+        res = st.session_state["result"]
+        st.success(f"Done! {res['summary']}")
         
-        st.download_button("Download seen_posts.txt", HISTORY_FILE.read_bytes() if HISTORY_FILE.exists() else b"", "seen_posts.txt")
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("Download HTML", res["html"], "digest.html", "text/html")
+        c2.download_button("Download Markdown", res["md"], "digest.md", "text/markdown")
+        c3.download_button("Download JSON", res["json"], "digest.json", "application/json")
+        
+        st.download_button("Download seen_posts.txt", res["history"], "seen_posts.txt")
         
         st.subheader("Preview")
-        st.components.v1.html(html_path.read_text(encoding="utf-8"), height=900, scrolling=True)
+        st.components.v1.html(res["html"], height=900, scrolling=True)
 
 # ---------------------------------------------------------------------------
 # CLI Entry Point
