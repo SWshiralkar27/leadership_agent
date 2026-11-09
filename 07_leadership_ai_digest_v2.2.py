@@ -1,17 +1,17 @@
-#!/usr/bin/env python3
 """
-Leadership AI Daily Digest Generator  --  v2.3
-(One sentence per line, "bold quoted" book name, no-repeat history file,
- copy icon, pluggable social search: Google CSE / Brave / Serper)
+Leadership AI Daily Digest Generator — v3.0
+============================================
 
-Fetch -> score/filter -> Gemini comment -> HTML / Markdown / JSON.
-Human-in-the-loop: the tool drafts, the author reviews and posts.
+Workflow:
+    discover → dedupe → keyword-screen → contextual analysis
+    → deterministic guardrails → conditional drafting
+    → export HTML/Markdown/JSON → human review.
+
+Fail-closed by design. No template fallbacks. Human publishes manually.
 """
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import tempfile
+import argparse
 import html
 import json
 import logging
@@ -19,139 +19,122 @@ import os
 import re
 import sys
 import time
-import webbrowser
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Iterable, Optional
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-import aiohttp
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from tenacity import retry, stop_after_attempt, wait_exponential
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Version & configuration
+# ---------------------------------------------------------------------------
+VERSION = "3.0"
+PROMPT_VERSION = "3.0.0"
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
-VERSION = "2.3"
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-
-BOOK_NAME = "Games for Gravitas"
-BOOK_FULL_TITLE = ("Games for Gravitas: A Playbook to Build Human Advantage "
-                   "in the Hybrid Intelligence Era")
-# YouTube / YouTube Shorts: the book is named in plain text ONLY (no hyperlink, no URL).
-BOOK_NAME_YOUTUBE = ("Games for Gravitas: Building a Future-Ready Workforce "
-                     "Through Game-Based Upskilling")
-# One canonical link (v2.1 had two). If your old .env still sets BOOK_URL to the
-# a.co link, delete that line or update it.
-BOOK_LINK = os.getenv(
-    "BOOK_URL",
-    "https://www.amazon.in/Games-Gravitas-Playbook-Advantage-Intelligence-ebook/dp/B0FYNLLZ32",
-)
 AUTHOR_NAME = os.getenv("AUTHOR_NAME", "Shreekant Shiralkar")
+BOOK_TITLE = "Games for Gravitas"
+BOOK_SUBTITLE = "A Playbook to Build Human Advantage in the Hybrid Intelligence Era"
+BOOK_FULL_TITLE = f"{BOOK_TITLE}: {BOOK_SUBTITLE}"
+BOOK_URL = os.getenv("BOOK_URL", "https://example.com/games-for-gravitas")
 
-DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
-CSE_DAYS_BACK = int(os.getenv("CSE_DAYS_BACK", "30"))  # social posts index slowly
+# Used by plain-text platforms (YouTube / Shorts)
+BOOK_NAME_YOUTUBE = BOOK_TITLE
+
+# Decision thresholds (spec §4)
+PROMOTION_THRESHOLD = int(os.getenv("PROMOTION_THRESHOLD", "80"))
+ENGAGEMENT_THRESHOLD = int(os.getenv("ENGAGEMENT_THRESHOLD", "60"))
+
+# Context gate (spec §5)
+MIN_CONTEXT_CHARS = int(os.getenv("MIN_CONTEXT_CHARS", "180"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))
+
+# History
+HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "seen_posts.txt"))
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "90"))
+IGNORE_HISTORY = os.getenv("IGNORE_HISTORY", "false").lower() == "true"
+
+# Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_DELAY_SECONDS = float(os.getenv("GEMINI_DELAY_SECONDS", "3"))
+
+# Retrieval (informational; enabled sources wired in discovery module below)
 MAX_RESULTS_PER_SOURCE = int(os.getenv("MAX_RESULTS_PER_SOURCE", "7"))
-MIN_ITEMS_PER_PLATFORM = int(os.getenv("MIN_ITEMS_PER_PLATFORM", "5"))
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.2"))
-RUN_ONCE = os.getenv("RUN_ONCE", "true").lower() in ("1", "true", "yes")
-RUN_INTERVAL_HOURS = float(os.getenv("RUN_INTERVAL_HOURS", "24"))
-INCLUDE_INSTAGRAM = os.getenv("INCLUDE_INSTAGRAM", "false").lower() in ("1", "true", "yes")
-ENABLE_SCRAPE_FALLBACK = os.getenv("ENABLE_SCRAPE_FALLBACK", "false").lower() in ("1", "true", "yes")
-GEMINI_DELAY_SECONDS = float(os.getenv("GEMINI_DELAY_SECONDS", "5"))  # free tier is ~15 requests/min or less
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()  # pin a model, e.g. gemini-2.5-flash
-# Empty = use 70-90 words everywhere. Example: SHORT_FORM_WORDS=40-55
-SHORT_FORM_WORDS = os.getenv("SHORT_FORM_WORDS", "").strip()
-SHORTS_MAX_SECONDS = int(os.getenv("SHORTS_MAX_SECONDS", "60"))  # Shorts can run up to 3 min
 
-SEARCH_TERMS = [t.strip() for t in os.getenv(
-    "SEARCH_TERMS",
-    "Leadership AI,AI in Leadership,Human-centered AI leadership,"
-    "hybrid intelligence,augmented intelligence,skill development AI",
-).split(",") if t.strip()]
+PROMPTS_DIR = Path(os.getenv("PROMPTS_DIR", Path(__file__).parent / "prompts"))
 
-MEDIUM_TAGS = [t.strip() for t in os.getenv(
-    "MEDIUM_TAGS",
-    "leadership-ai,artificial-intelligence,hybrid-intelligence,"
-    "augmented-intelligence,skill-development,leadership",
-).split(",") if t.strip()]
-
-DESKTOP_PATH = Path(os.path.expanduser("~/Desktop/Leadership_AI_Digest"))
-MODEL_CACHE_FILE = Path(".gemini_model_cache.json")
-MODEL_CACHE_TTL_HOURS = 24
-
-# v2.3: history of posts already shown (plain text, stored next to the outputs)
-HISTORY_FILE = Path(os.path.expanduser(os.getenv("HISTORY_FILE", str(DESKTOP_PATH / "seen_posts.txt"))))
-HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "365"))  # 0 = keep forever
-IGNORE_HISTORY = os.getenv("IGNORE_HISTORY", "false").lower() in ("1", "true", "yes")
-
-# v2.3: social search provider. Google's Custom Search JSON API is closed to new
-# customers and ends on 2027-01-01, so Brave / Serper are supported as drop-ins.
-SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "cse").strip().lower()  # cse | brave | serper
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-SEARCH_PAGES = int(os.getenv("SEARCH_PAGES", "2"))
-CSE_MAX_TERMS = int(os.getenv("CSE_MAX_TERMS", "3"))  # search terms per query (shorter queries match more)
-PLATFORM_DOMAINS = {"LinkedIn": ("linkedin.com",), "Facebook": ("facebook.com",),
-                    "X": ("x.com", "twitter.com"), "Instagram": ("instagram.com",)}
-
-# (platform key, icon). Order = section order in the outputs.
-PLATFORMS = [
-    ("Medium", "📝"), ("YouTube", "▶️"), ("YouTube Shorts", "🎬"),
-    ("LinkedIn", "💼"), ("Facebook", "📘"), ("X", "🐦"),
+# Book themes with descriptions — populated into analysis prompt (spec §6).
+BOOK_THEMES: list[tuple[str, str]] = [
+    ("Centaur leadership",
+     "Humans and AI together out-think either one alone."),
+    ("Purposeful rehearsal",
+     "Structured games let leaders rehearse high-stakes decisions safely."),
+    ("Playbook over theory",
+     "Modular exercises that leaders actively apply."),
+    ("Non-automatable skills",
+     "Judgment, intuition, empathy, ethics and creativity."),
+    ("Hybrid Intelligence Era",
+     "AI as a strategic collaborator; humans and AI co-evolve."),
+    ("Structured human-AI teaming",
+     "The 7-Phase Model for blended human-AI teams."),
 ]
-if INCLUDE_INSTAGRAM:
-    PLATFORMS.append(("Instagram", "📸"))
-PLATFORM_ORDER = [p for p, _ in PLATFORMS]
-PLATFORM_ICON = dict(PLATFORMS)
-PLATFORM_LABEL = {"X": "X (Twitter)"}
 
-# Platforms whose comments are plain text (no bold, no links, _underscores_ only).
 PLAIN_TEXT_PLATFORMS = {"YouTube", "YouTube Shorts"}
-SHORT_FORM_PLATFORMS = {"YouTube Shorts", "X"}
-
-BOOK_THEMES = [
-    {"name": "Centaur leadership",
-     "detail": "Humans and AI together out-think either one alone."},
-    {"name": "Purposeful rehearsal",
-     "detail": "Structured games let leaders rehearse high-stakes decisions safely."},
-    {"name": "Playbook over theory",
-     "detail": "Modular exercises that leaders actively apply, not just read about."},
-    {"name": "Non-automatable skills",
-     "detail": "Judgment, intuition, empathy, ethics and creativity stay human."},
-    {"name": "Hybrid Intelligence Era",
-     "detail": "AI is a strategic collaborator; humans and AI co-evolve."},
-    {"name": "Structured human-AI teaming",
-     "detail": "The 7-Phase Model for building blended human-AI teams."},
-]
-
-KEYWORDS = {
-    "ai": 1.0, "artificial intelligence": 1.2, "leadership": 1.5, "leader": 1.3,
-    "skill": 1.0, "development": 0.8, "management": 0.8, "executive": 0.9,
-    "decision making": 1.2, "gravitas": 1.5, "ambiguity": 1.2, "rehearsal": 1.0,
-    "coaching": 0.9,
-    # added in v2.2
-    "hybrid intelligence": 1.5, "augmented intelligence": 1.3, "human-ai": 1.0,
-    "human-centered": 1.0, "upskilling": 0.9, "reskilling": 0.9, "learning": 0.7,
+PLATFORM_ORDER = ["LinkedIn", "X", "Medium", "YouTube", "YouTube Shorts",
+                  "Facebook", "Instagram"]
+PLATFORM_LABEL = {
+    "LinkedIn": "LinkedIn", "X": "X / Twitter", "Medium": "Medium",
+    "YouTube": "YouTube", "YouTube Shorts": "YouTube Shorts",
+    "Facebook": "Facebook", "Instagram": "Instagram",
+}
+PLATFORM_ICON = {
+    "LinkedIn": "in", "X": "X", "Medium": "M",
+    "YouTube": "▶", "YouTube Shorts": "▶", "Facebook": "f",
+    "Instagram": "IG",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+KEYWORDS: tuple[str, ...] = (
+    "ai", "artificial", "intelligence", "leadership", "leader", "hybrid",
+    "centaur", "judgment", "judgement", "rehearsal", "playbook", "team",
+    "teaming", "human", "automat", "empathy", "ethics", "creativity",
+)
 
-# ----------------------------------------------------------------------------
-# Data models
-# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)-7s %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("digest")
+
+
+# ---------------------------------------------------------------------------
+# Enums & data model
+# ---------------------------------------------------------------------------
+class Decision(str, Enum):
+    A_PROMOTE = "A_PROMOTE"
+    B_ENGAGE = "B_ENGAGE"
+    C_SENSITIVE = "C_SENSITIVE"
+    D_SKIP = "D_SKIP"
+
+
+class Sensitivity(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class Confidence(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
 @dataclass
 class ContentItem:
     platform: str
@@ -160,1139 +143,714 @@ class ContentItem:
     source: str = ""
     published: str = ""
     snippet: str = ""
-    comment: str = ""
+    full_content: str = ""
+    fetched_at: str = field(
+        default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    # Discovery score (keyword-only; NOT contextual fit)
     relevance_score: float = 0.0
-    backfilled: bool = False
-    fetched_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
-    def __post_init__(self):
-        self.title = clean_text(self.title)
-        self.snippet = clean_text(self.snippet)
-        self.source = clean_text(self.source)
+    # Analysis outputs
+    decision: Decision = Decision.D_SKIP
+    decision_reason: str = ""
+    context_summary: str = ""
+    sensitivity: Sensitivity = Sensitivity.LOW
+    sensitivity_reason: str = ""
+    confidence: Confidence = Confidence.LOW
+    book_theme: str = ""
+    book_alignment_score: int = 0
+    contextual_relevance_score: int = 0
+    engagement_score: int = 0
+    audience_alignment_score: int = 0
+    promotion_naturalness_score: int = 0
+    promotion_score: int = 0
+    promotion_justification: str = ""
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    # Drafts (only for A_PROMOTE / B_ENGAGE)
+    comment: str = ""
+    alternatives: list[str] = field(default_factory=list)
+
+    # Diagnostics
+    rejection_reason: str = ""
+    analysis_error: str = ""
+
+    @property
+    def content_for_analysis(self) -> str:
+        raw = self.full_content or self.snippet
+        return clean_text(raw)[:MAX_CONTEXT_CHARS]
 
 
 @dataclass
 class Digest:
     date: str
     total_items: int
-    items_by_platform: Dict[str, List[ContentItem]]
+    items_by_platform: dict[str, list[ContentItem]]
     summary: str
     generated_at: str
+    version: str = VERSION
+    prompt_version: str = PROMPT_VERSION
 
-    def to_dict(self) -> dict:
-        return {
-            "date": self.date,
-            "total_items": self.total_items,
-            "items_by_platform": {p: [i.to_dict() for i in its]
-                                  for p, its in self.items_by_platform.items()},
-            "summary": self.summary,
-            "generated_at": self.generated_at,
-        }
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Utilities
-# ----------------------------------------------------------------------------
-def clean_text(text: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+# ---------------------------------------------------------------------------
+_WHITESPACE = re.compile(r"\s+")
+_TAG = re.compile(r"<[^>]+>")
 
 
-def strip_html_to_text(raw: Optional[str]) -> str:
-    if not raw:
+def clean_text(text: str) -> str:
+    if not text:
         return ""
-    return clean_text(BeautifulSoup(raw, "html.parser").get_text(separator=" "))
+    text = _TAG.sub(" ", text)
+    text = html.unescape(text)
+    return _WHITESPACE.sub(" ", text).strip()
 
 
 def truncate_at_boundary(text: str, limit: int) -> str:
-    """Cut at the last space (never mid-word) and append an ellipsis."""
-    text = text or ""
     if len(text) <= limit:
         return text
-    cut = text[:limit]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut.rstrip(" ,;:-\u2013\u2014.!?") + "\u2026"
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut + "…"
 
 
-def is_valid_url(url: Optional[str]) -> bool:
-    return bool(url and url.startswith(("http://", "https://")))
+def _parse_date(value: str) -> datetime:
+    if not value:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def ensure_complete_sentence(text: str) -> str:
-    text = (text or "").strip()
-    if text and text[-1] not in ".!?":
-        text = text.rstrip(",;:-") + "."
-    return text
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "ref", "ref_src", "src", "si", "s", "share",
+}
 
 
-# MUST stay identical to splitIntoSentences() in COPY_BUTTON_SCRIPT (invariant 7).
-# v2.2: the lookahead also accepts a curly opening quote and Unicode bold/italic
-# letters, because the Copy button splits AFTER converting markdown to Unicode.
-_SENT_SPLIT = re.compile(
-    r'(?<=[.!?])\s+(?=[A-Z0-9"\'\u201C*_\[\U0001D400-\U0001D7FF\u210E])'
-)
-_ABBREV = re.compile(r"\b([A-Za-z]\.){1,}[A-Za-z]?$")
-
-
-def split_into_sentences(text: str) -> List[str]:
-    if not text:
-        return []
-    out: List[str] = []
-    for piece in _SENT_SPLIT.split(text):
-        if out and _ABBREV.search(out[-1]):
-            out[-1] += " " + piece
-        else:
-            out.append(piece)
-    return [s.strip() for s in out if s.strip()]
-
-
-def format_sentences_on_new_lines(text: str, separator: str = "\n\n") -> str:
-    if not text:
-        return text
-    sentences = split_into_sentences(text)
-    if len(sentences) <= 1:
-        return text
-    return separator.join(s.strip() for s in sentences if s.strip())
+def normalize_url(url: str) -> str:
+    p = urlparse(url)
+    q = [(k, v) for k, v in parse_qsl(p.query) if k not in _TRACKING_PARAMS]
+    path = p.path.rstrip("/")
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), path,
+                       "", urlencode(sorted(q)), ""))
 
 
 def calculate_relevance_score(item: ContentItem) -> float:
+    """Keyword-only discovery score (spec §8). Not contextual fit."""
     text = f"{item.title} {item.snippet}".lower()
-    score = 0.0
-    for kw, weight in KEYWORDS.items():
-        if kw == "ai":
-            # word boundary, otherwise "said"/"again"/"training" all match
-            if re.search(r"\bai\b", text):
-                score += weight
-        elif kw in text:
-            score += weight
-    score = min(score / 12.0, 1.0)
-    if item.platform in ("Medium", "YouTube", "YouTube Shorts"):
-        score *= 1.2
-    return round(min(score, 1.0), 3)
+    tokens = re.findall(r"[a-z]+", text)
+    if not tokens:
+        return 0.0
+    hits = sum(1 for t in tokens if t in KEYWORDS)
+    return hits / len(tokens)
 
 
-def _parse_date(s: str) -> datetime:
-    floor = datetime.min.replace(tzinfo=timezone.utc)
-    if not s:
-        return floor
-    try:
-        d = parsedate_to_datetime(s)
-    except (TypeError, ValueError):
-        try:
-            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except ValueError:
-            return floor
-    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+def _word_range(platform: str) -> tuple[int, int]:
+    return {
+        "LinkedIn": (40, 80),
+        "X": (20, 60),
+        "Medium": (60, 120),
+        "YouTube": (30, 90),
+        "YouTube Shorts": (25, 70),
+        "Facebook": (35, 90),
+        "Instagram": (20, 60),
+    }.get(platform, (40, 90))
 
 
-def _url_key(url: str) -> str:
-    url = (url or "").strip()
-    if "youtube.com/watch" in url:
-        m = re.search(r"[?&]v=([\w-]{6,})", url)
-        return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url.rstrip("/")
-    key = url.split("#")[0].split("?")[0].rstrip("/")
-    # regional / mobile hosts -> one canonical host, so the same post is never counted twice
-    key = re.sub(r"^https?://(?:[a-z]{2,3}|m|mobile|www)\.(linkedin|facebook)\.com",
-                 r"https://www.\1.com", key, flags=re.I)
-    key = re.sub(r"^https?://(?:www\.)?(?:twitter|x)\.com", "https://x.com", key, flags=re.I)
-    return key
-
-
-def _history_cutoff() -> str:
-    if HISTORY_DAYS <= 0:
-        return "0000-00-00"
-    return (datetime.now() - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
-
-
-def load_history(today: str) -> set:
-    """URL keys of posts shown on EARLIER days. Lines dated today are ignored, so a
-    same-day re-run reproduces the same digest instead of coming back empty."""
-    keys: set = set()
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+def load_history() -> set[str]:
     if IGNORE_HISTORY or not HISTORY_FILE.exists():
-        return keys
-    cutoff = _history_cutoff()
+        return set()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
+    urls: set[str] = set()
     for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 3 and cutoff <= parts[0] < today:
-            keys.add(parts[2])
-    logging.info("History: %d earlier post(s) will be skipped (%s)", len(keys), HISTORY_FILE)
-    return keys
-
-
-def save_history(digest: "Digest") -> None:
-    """Rewrite the history file: keep earlier days, replace today's lines, drop expired ones.
-    Format per line: date <TAB> platform <TAB> url_key <TAB> title."""
-    try:
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        cutoff = _history_cutoff()
-        keep: List[str] = []
-        if HISTORY_FILE.exists():
-            for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
-                d = line.split("\t", 1)[0]
-                if line.strip() and cutoff <= d < digest.date:
-                    keep.append(line)
-        new = [f"{digest.date}\t{it.platform}\t{_url_key(it.url)}\t{truncate_at_boundary(it.title, 80)}"
-               for its in digest.items_by_platform.values() for it in its]
-        HISTORY_FILE.write_text("\n".join(keep + new) + "\n", encoding="utf-8")
-        logging.info("History saved: %d earlier + %d new line(s)", len(keep), len(new))
-    except Exception as ex:
-        logging.warning("Could not save history: %s", ex)
-
-
-# ----------------------------------------------------------------------------
-# Fetchers
-# ----------------------------------------------------------------------------
-HEADERS = {"User-Agent": "Mozilla/5.0 (LeadershipAIDigest)"}
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
-async def _fetch_feed(session: aiohttp.ClientSession, url: str) -> str:
-    async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-        resp.raise_for_status()
-        return await resp.text()
-
-
-async def fetch_medium_articles(session: aiohttp.ClientSession,
-                                limit: int = MAX_RESULTS_PER_SOURCE) -> List[ContentItem]:
-    logging.info("Fetching Medium (%d tags)...", len(MEDIUM_TAGS))
-    items: List[ContentItem] = []
-    seen = set()
-    for tag in MEDIUM_TAGS:
-        try:
-            feed = feedparser.parse(await _fetch_feed(session, f"https://medium.com/feed/tag/{tag}"))
-        except Exception as ex:
-            logging.error("Medium tag %s error: %s", tag, ex)
+        line = line.strip()
+        if not line:
             continue
-        for e in feed.entries[:limit]:
-            link = getattr(e, "link", "")
-            if not is_valid_url(link) or _url_key(link) in seen:
-                continue
-            seen.add(_url_key(link))
-            body = ""
-            if getattr(e, "content", None):
-                body = e.content[0].get("value", "")
-            body = strip_html_to_text(body or getattr(e, "summary", ""))
-            items.append(ContentItem("Medium", getattr(e, "title", ""), link,
-                                     getattr(e, "author", ""), getattr(e, "published", ""),
-                                     truncate_at_boundary(body, 300)))
-    return items
+        url, _, ts = line.partition("\t")
+        if ts:
+            try:
+                when = datetime.fromisoformat(ts)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if when < cutoff:
+                    continue
+            except ValueError:
+                pass
+        urls.add(url)
+    return urls
 
 
-def _iso_duration_seconds(d: str) -> int:
-    m = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d or "")
-    if not m:
-        return 10 ** 6
-    days, h, mi, s = (int(x or 0) for x in m.groups())
-    return days * 86400 + h * 3600 + mi * 60 + s
+def save_history(urls: Iterable[str]) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    existing = {}
+    if HISTORY_FILE.exists():
+        for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+            url, _, ts = line.partition("\t")
+            if url:
+                existing[url] = ts
+    for u in urls:
+        existing[normalize_url(u)] = now
+    HISTORY_FILE.write_text(
+        "\n".join(f"{u}\t{ts}" for u, ts in sorted(existing.items())),
+        encoding="utf-8",
+    )
 
 
-def fetch_youtube_updates(limit: int = MAX_RESULTS_PER_SOURCE) -> List[ContentItem]:
-    """Returns YouTube and YouTube Shorts items (Shorts = duration <= SHORTS_MAX_SECONDS, default 60 s)."""
-    logging.info("Fetching YouTube + Shorts...")
-    if not YOUTUBE_API_KEY:
-        logging.warning("YouTube API key not set - skipping YouTube / Shorts.")
-        return []
-    published_after = (datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    q = " | ".join(SEARCH_TERMS)
-    try:
-        yt = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
-        snippets: Dict[str, dict] = {}
-        # Two searches (200 quota units): any duration, and "short" (<4 min) to
-        # make sure Shorts candidates are present.
-        for duration in ("any", "short"):
-            resp = yt.search().list(
-                q=q, part="snippet", type="video", order="date",
-                publishedAfter=published_after, videoDuration=duration,
-                maxResults=min(limit * 4, 50),
-            ).execute()
-            for it in resp.get("items", []):
-                vid = it.get("id", {}).get("videoId")
-                if vid and vid not in snippets:
-                    snippets[vid] = it.get("snippet", {})
-        durations: Dict[str, int] = {}
-        ids = list(snippets)
-        for i in range(0, len(ids), 50):
-            det = yt.videos().list(part="contentDetails", id=",".join(ids[i:i + 50])).execute()
-            for v in det.get("items", []):
-                durations[v["id"]] = _iso_duration_seconds(v["contentDetails"].get("duration", ""))
-        items: List[ContentItem] = []
-        for vid, sn in snippets.items():
-            is_short = durations.get(vid, 10 ** 6) <= SHORTS_MAX_SECONDS
-            platform = "YouTube Shorts" if is_short else "YouTube"
-            url = f"https://www.youtube.com/shorts/{vid}" if is_short else f"https://www.youtube.com/watch?v={vid}"
-            items.append(ContentItem(platform, sn.get("title", ""), url, sn.get("channelTitle", ""),
-                                     sn.get("publishedAt", ""), truncate_at_boundary(clean_text(sn.get("description", "")), 300)))
-        return items
-    except HttpError as e:
-        logging.error("YouTube API error: %s", e)
-        return []
-    except Exception as e:  # network etc.
-        logging.error("YouTube fetch failed: %s", e)
-        return []
-
-
-CSE_URL = "https://www.googleapis.com/customsearch/v1"
-
-
-class SearchError(RuntimeError):
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
+class GeminiUnavailable(RuntimeError):
     pass
 
 
-def search_provider_ready() -> bool:
-    if SEARCH_PROVIDER == "brave":
-        return bool(BRAVE_API_KEY)
-    if SEARCH_PROVIDER == "serper":
-        return bool(SERPER_API_KEY)
-    return bool(GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID)
+class GeminiClient:
+    """Thin wrapper around google-generativeai with retries."""
 
-
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(min=2, max=8), reraise=True)
-async def _cse_request(session: aiohttp.ClientSession, query: str, start: int = 1) -> dict:
-    params = {"key": GOOGLE_CSE_API_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": 10,
-              "start": start, "dateRestrict": f"d{CSE_DAYS_BACK}"}
-    async with session.get(CSE_URL, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-        body = await resp.text()
-        if resp.status != 200:
-            raise SearchError(f"Google CSE HTTP {resp.status}: {body[:300]}")
-        return json.loads(body)
-
-
-async def _search_cse(session: aiohttp.ClientSession, query: str) -> List[dict]:
-    out: List[dict] = []
-    for page in range(SEARCH_PAGES):
-        got = (await _cse_request(session, query, start=1 + 10 * page)).get("items") or []
-        out += [{"title": r.get("title", ""), "link": r.get("link", ""), "snippet": r.get("snippet", "")} for r in got]
-        if len(got) < 10:
-            break
-    return out
-
-
-async def _search_brave(session: aiohttp.ClientSession, query: str) -> List[dict]:
-    out: List[dict] = []
-    fresh = "pw" if CSE_DAYS_BACK <= 7 else "pm" if CSE_DAYS_BACK <= 31 else "py"
-    for page in range(SEARCH_PAGES):
-        params = {"q": query, "count": 20, "offset": page, "freshness": fresh}
-        headers = {"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY or ""}
-        async with session.get("https://api.search.brave.com/res/v1/web/search", params=params,
-                               headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                raise SearchError(f"Brave HTTP {resp.status}: {(await resp.text())[:300]}")
-            data = await resp.json()
-        got = (data.get("web") or {}).get("results") or []
-        out += [{"title": strip_html_to_text(r.get("title", "")), "link": r.get("url", ""),
-                 "snippet": strip_html_to_text(r.get("description", ""))} for r in got]
-        if len(got) < 20:
-            break
-    return out
-
-
-async def _search_serper(session: aiohttp.ClientSession, query: str) -> List[dict]:
-    out: List[dict] = []
-    tbs = "qdr:w" if CSE_DAYS_BACK <= 7 else "qdr:m" if CSE_DAYS_BACK <= 31 else "qdr:y"
-    for page in range(1, SEARCH_PAGES + 1):
-        headers = {"X-API-KEY": SERPER_API_KEY or "", "Content-Type": "application/json"}
-        async with session.post("https://google.serper.dev/search",
-                                json={"q": query, "num": 10, "page": page, "tbs": tbs},
-                                headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                raise SearchError(f"Serper HTTP {resp.status}: {(await resp.text())[:300]}")
-            data = await resp.json()
-        got = data.get("organic") or []
-        out += [{"title": r.get("title", ""), "link": r.get("link", ""), "snippet": r.get("snippet", "")} for r in got]
-        if len(got) < 10:
-            break
-    return out
-
-
-async def web_search_raw(session: aiohttp.ClientSession, query: str) -> List[dict]:
-    fn = {"brave": _search_brave, "serper": _search_serper}.get(SEARCH_PROVIDER, _search_cse)
-    return await fn(session, query)
-
-
-def scrape_fallback(query: str) -> List[dict]:
-    """Fragile last resort (div.yuRUbf). Off by default; may breach Google's terms."""
-    try:
-        r = requests.get("https://www.google.com/search", params={"q": query},
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
-        return [{"title": a.get_text(), "link": a["href"], "snippet": ""}
-                for a in soup.select("div.yuRUbf a") if a.get("href")]
-    except Exception as ex:
-        logging.error("scrape_fallback failed: %s", ex)
-        return []
-
-
-async def social_search(session: aiohttp.ClientSession, query: str, platform: str,
-                        limit: int = MAX_RESULTS_PER_SOURCE) -> List[ContentItem]:
-    raw: List[dict] = []
-    if search_provider_ready():
+    def __init__(self, api_key: str, model_name: str):
+        if not api_key:
+            raise GeminiUnavailable("GEMINI_API_KEY is not set.")
         try:
-            raw = await web_search_raw(session, query)
-        except Exception as ex:
-            logging.error("%s search error (%s): %s", platform, SEARCH_PROVIDER, ex)
-    else:
-        logging.warning("Search provider '%s' not configured - %s will be empty.", SEARCH_PROVIDER, platform)
-    if not raw and ENABLE_SCRAPE_FALLBACK:
-        logging.info("%s: falling back to scraping", platform)
-        raw = await asyncio.to_thread(scrape_fallback, query)
-    domains = PLATFORM_DOMAINS.get(platform, ())
-    items: List[ContentItem] = []
-    for r in raw:
-        link = r.get("link", "")
-        if is_valid_url(link) and (not domains or any(d in link.lower() for d in domains)):
-            items.append(ContentItem(platform, r.get("title", ""), link, f"{SEARCH_PROVIDER} search",
-                                     "", r.get("snippet", "")))
-    logging.info("%s: %d result(s) for query: %s", platform, len(items), truncate_at_boundary(query, 90))
-    return items
+            import google.generativeai as genai  # lazy
+        except ImportError as exc:
+            raise GeminiUnavailable(
+                "google-generativeai not installed. pip install google-generativeai"
+            ) from exc
+        genai.configure(api_key=api_key)
+        self._model = genai.GenerativeModel(model_name)
+        self.model_name = model_name
 
-
-def _social_queries(site_expr: str) -> List[str]:
-    """Several SHORT queries instead of one long OR of every term (long exact-phrase ORs match little)."""
-    n = max(1, CSE_MAX_TERMS)
-    qs = []
-    for i in range(0, len(SEARCH_TERMS), n):
-        terms = " OR ".join(f'"{t}"' for t in SEARCH_TERMS[i:i + n])
-        qs.append(f"({terms}) {site_expr}")
-    return qs
-
-
-async def _social(session, platform: str, site_expr: str, limit: int) -> List[ContentItem]:
-    batches = await asyncio.gather(*[social_search(session, q, platform, limit) for q in _social_queries(site_expr)])
-    merged, seen = [], set()
-    for batch in batches:
-        for it in batch:
-            k = _url_key(it.url)
-            if k not in seen:
-                seen.add(k)
-                merged.append(it)
-    return merged
-
-
-async def fetch_linkedin_updates(session, limit=MAX_RESULTS_PER_SOURCE):
-    logging.info("Fetching LinkedIn...")
-    # public LinkedIn posts and articles live under /posts/ and /pulse/
-    return await _social(session, "LinkedIn", "(site:linkedin.com/posts OR site:linkedin.com/pulse)", limit)
-
-
-async def fetch_facebook_updates(session, limit=MAX_RESULTS_PER_SOURCE):
-    logging.info("Fetching Facebook...")
-    return await _social(session, "Facebook", "site:facebook.com", limit)
-
-
-async def fetch_x_updates(session, limit=MAX_RESULTS_PER_SOURCE):
-    logging.info("Fetching X (Twitter)...")
-    return await _social(session, "X", "(site:x.com OR site:twitter.com)", limit)
-
-
-async def fetch_instagram_updates(session, limit=MAX_RESULTS_PER_SOURCE):
-    logging.info("Fetching Instagram...")
-    return await _social(session, "Instagram", "site:instagram.com", limit)
-
-
-async def diagnose_search() -> None:
-    """python leadership_ai_digest.py --diagnose : shows exactly why social search returns nothing."""
-    print(f"Provider: {SEARCH_PROVIDER}   configured: {search_provider_ready()}")
-    if not search_provider_ready():
-        print("-> keys missing in .env (cse: GOOGLE_CSE_API_KEY + GOOGLE_CSE_ID; brave: BRAVE_API_KEY; serper: SERPER_API_KEY)")
-        return
-    tests = [("open web, no site filter", "leadership AI"),
-             ("LinkedIn, simple", "leadership AI site:linkedin.com"),
-             ("LinkedIn /posts + /pulse", "leadership AI (site:linkedin.com/posts OR site:linkedin.com/pulse)"),
-             ("Facebook, simple", "leadership AI site:facebook.com"),
-             ("X / Twitter, simple", "leadership AI (site:x.com OR site:twitter.com)")]
-    tests.append(("LinkedIn, real query #1", _social_queries("(site:linkedin.com/posts OR site:linkedin.com/pulse)")[0]))
-    async with aiohttp.ClientSession() as s:
-        for label, q in tests:
+    def generate(self, prompt: str, *, max_tokens: int = 1200,
+                 retries: int = 2) -> str:
+        last_err: Optional[Exception] = None
+        for attempt in range(retries + 1):
             try:
-                res = await web_search_raw(s, q)
-                sample = res[0]["link"] if res else "-"
-                print(f"[{'OK  ' if res else 'ZERO'}] {label}: {len(res)} result(s)  e.g. {sample}")
-            except Exception as ex:
-                print(f"[FAIL] {label}: {str(ex)[:300]}")
-    print("\nHow to read it: HTTP 403 on every line = key/engine not allowed (Google closed the API to new customers);\n"
-          "OK on 'open web' but ZERO on site: lines = engine limited to listed sites or the platform is not indexed;\n"
-          "OK everywhere but few results in the digest = tune SEARCH_TERMS / CSE_DAYS_BACK.")
-
-
-async def fetch_all_content() -> List[ContentItem]:
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            fetch_medium_articles(session),
-            asyncio.to_thread(fetch_youtube_updates),  # googleapiclient is synchronous
-            fetch_linkedin_updates(session),
-            fetch_facebook_updates(session),
-            fetch_x_updates(session),
-        ]
-        if INCLUDE_INSTAGRAM:
-            tasks.append(fetch_instagram_updates(session))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    items: List[ContentItem] = []
-    for r in results:
-        if isinstance(r, Exception):
-            logging.error("Fetcher failed: %s", r)
-        else:
-            items.extend(r)
-    logging.info("Total items fetched: %d", len(items))
-    return items
-
-# ----------------------------------------------------------------------------
-# Gemini
-# ----------------------------------------------------------------------------
-class GeminiModelManager:
-    BASE = "https://generativelanguage.googleapis.com/v1beta"
-    SKIP = ("embedding", "tts", "image", "vision", "aqa", "live", "audio", "imagen", "veo")
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.model_name: Optional[str] = None
-        self.no_thinking: set = set()  # models that rejected thinkingConfig (remembered)
-
-    def _headers(self) -> dict:
-        return {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
-
-    def _get_cached_model(self) -> Optional[str]:
-        try:
-            data = json.loads(MODEL_CACHE_FILE.read_text())
-            age = datetime.now() - datetime.fromisoformat(data["timestamp"])
-            if age < timedelta(hours=MODEL_CACHE_TTL_HOURS):
-                return data["model"]
-        except Exception:
-            pass
-        return None
-
-    def _save_cached_model(self, name: str) -> None:
-        try:
-            MODEL_CACHE_FILE.write_text(json.dumps({"model": name, "timestamp": datetime.now().isoformat()}))
-        except Exception as ex:
-            logging.warning("Could not write model cache: %s", ex)
-
-    def discover_models(self) -> List[str]:
-        try:
-            r = requests.get(f"{self.BASE}/models", headers=self._headers(), timeout=30)
-            r.raise_for_status()
-            names = []
-            for m in r.json().get("models", []):
-                if "generateContent" in m.get("supportedGenerationMethods", []):
-                    n = m["name"].split("/")[-1]
-                    if not any(s in n for s in self.SKIP):
-                        names.append(n)
-            # prefer flash, then stable over preview/experimental
-            names.sort(key=lambda n: (0 if "flash" in n else 1,
-                                      1 if ("preview" in n or "exp" in n) else 0, n))
-            return names
-        except Exception as ex:
-            logging.warning("Model discovery failed: %s", ex)
-            return []
-
-    def _get_known_models(self) -> List[str]:
-        # Refresh when convenient; discovery normally supersedes this list.
-        return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-
-    @staticmethod
-    def _model_uses_thinking_budget(name: str) -> bool:
-        return any(k in name for k in ("2.5", "3.0", "gemini-3", "thinking"))
-
-    def _post(self, model: str, prompt: str, max_tokens: int, use_thinking: bool):
-        gen = {"temperature": 0.7, "maxOutputTokens": max_tokens, "topP": 0.9, "topK": 40}
-        if use_thinking:
-            gen["thinkingConfig"] = {"thinkingBudget": 0}  # invariant 1
-        body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
-        r = requests.post(f"{self.BASE}/models/{model}:generateContent",
-                          headers=self._headers(), json=body, timeout=90)
-        try:
-            data = r.json()
-        except Exception:
-            data = {}
-        return r.status_code, data
-
-    def test_model(self, name: str) -> bool:
-        try:
-            uses = self._model_uses_thinking_budget(name)
-            status, data = self._post(name, "Say 'test'", 10, uses)
-            if status == 400 and uses:
-                status, data = self._post(name, "Say 'test'", 10, False)
-                if status == 200:
-                    self.no_thinking.add(name)
-            ok = status == 200 and bool(data.get("candidates"))
-            if not ok:
-                logging.warning("Model test failed for %s: HTTP %s %s", name, status,
-                                str((data.get("error") or {}).get("message", ""))[:150])
-            return ok
-        except Exception as ex:
-            logging.warning("Model test error for %s: %s", name, ex)
-            return False
-
-    def get_working_model(self) -> Optional[str]:
-        if not self.api_key:
-            logging.warning("GEMINI_API_KEY not set - fallback comments will be used.")
-            return None
-        candidates: List[str] = []
-        if GEMINI_MODEL:
-            candidates.append(GEMINI_MODEL)
-        cached = self._get_cached_model()
-        if cached:
-            candidates.append(cached)
-        candidates += [m for m in self.discover_models() if m not in candidates]
-        candidates += [m for m in self._get_known_models() if m not in candidates]
-        for name in candidates[:12]:
-            if self.test_model(name):
-                self.model_name = name
-                self._save_cached_model(name)
-                logging.info("Using Gemini model: %s", name)
-                return name
-        logging.error("No working Gemini model found")
-        return None
-
-    def generate_content(self, prompt: str, max_tokens: int = 800) -> Optional[dict]:
-        if not self.model_name:
-            return None
-        use_thinking = self._model_uses_thinking_budget(self.model_name) and self.model_name not in self.no_thinking
-        for attempt in range(4):
-            try:
-                status, data = self._post(self.model_name, prompt, max_tokens, use_thinking)
-            except Exception as ex:
-                logging.error("Gemini request error: %s", ex)
+                resp = self._model.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": max_tokens,
+                        "temperature": 0.3,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                return (resp.text or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                log.warning("Gemini call failed (attempt %d/%d): %s",
+                            attempt + 1, retries + 1, exc)
                 time.sleep(2 ** attempt)
-                continue
-            if status == 400 and use_thinking:
-                logging.warning("thinkingConfig rejected by %s; retrying without it (remembered for this model)", self.model_name)
-                self.no_thinking.add(self.model_name)
-                use_thinking = False
-                continue
-            if status in (429, 500, 503):
-                blob = json.dumps(data)
-                if status == 429 and "PerDay" in blob:
-                    logging.error("Gemini DAILY quota exhausted for %s. Wait for the reset, pin another model "
-                                  "(GEMINI_MODEL) or enable billing.", self.model_name)
+        raise GeminiUnavailable(f"Gemini failed after retries: {last_err}")
+
+
+def _gemini_json(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        val = json.loads(cleaned)
+        return val if isinstance(val, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # balanced-brace scan for first complete object
+    depth, start = 0, -1
+    in_str, esc = False, False
+    for i, ch in enumerate(cleaned):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    val = json.loads(cleaned[start:i + 1])
+                    return val if isinstance(val, dict) else None
+                except json.JSONDecodeError:
                     return None
-                wait = 2 ** attempt * 2
-                m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', blob)
-                if m:
-                    wait = min(float(m.group(1)) + 1, 70)
-                logging.warning("Gemini HTTP %s on %s (attempt %d/4): %s - waiting %.0fs", status, self.model_name,
-                                attempt + 1, str((data.get("error") or {}).get("message", ""))[:160], wait)
-                time.sleep(wait)
-                continue
-            if status != 200:
-                logging.error("Gemini HTTP %s: %s", status, str(data)[:200])
-                return None
-            cands = data.get("candidates") or []
-            if not cands:
-                return {"text": "", "truncated": True, "finish_reason": "NO_CANDIDATE"}
-            cand = cands[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts).strip()
-            finish = cand.get("finishReason", "")
-            return {"text": text, "truncated": finish == "MAX_TOKENS" or not text,
-                    "finish_reason": finish}
+    return None
+
+
+def _bounded_score(value: Any) -> int:
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Prompt loading
+# ---------------------------------------------------------------------------
+_PROMPT_CACHE: dict[str, str] = {}
+
+
+def _load_prompt(name: str) -> str:
+    if name in _PROMPT_CACHE:
+        return _PROMPT_CACHE[name]
+    path = PROMPTS_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt not found: {path}")
+    _PROMPT_CACHE[name] = path.read_text(encoding="utf-8")
+    return _PROMPT_CACHE[name]
+
+
+def _themes_block() -> str:
+    return "\n".join(f"- {name} — {desc}" for name, desc in BOOK_THEMES)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Analysis
+# ---------------------------------------------------------------------------
+# Keys the analysis model MUST return (contract with prompt).
+ANALYSIS_KEYS = {
+    "decision", "decision_reason", "context_summary",
+    "sensitivity", "sensitivity_reason", "confidence",
+    "book_theme", "book_alignment_score", "contextual_relevance_score",
+    "engagement_score", "audience_alignment_score",
+    "promotion_naturalness_score", "promotion_justification",
+}
+
+ALLOWED_DECISIONS = {d.value for d in Decision}
+
+
+def analyse_post(client: GeminiClient, item: ContentItem) -> Optional[dict]:
+    """
+    Stage 1: classify the post. Returns validated dict or None.
+    Fail-closed: any error → None (caller marks D_SKIP).
+    """
+    context = item.content_for_analysis
+    actual_chars = len(context)
+
+    prompt = _load_prompt("v3_analysis.md").format(
+        platform=item.platform,
+        title=item.title,
+        source=item.source or "(unknown)",
+        content=context or "(no usable text supplied)",
+        book_themes=_themes_block(),
+    )
+    try:
+        raw = client.generate(prompt, max_tokens=1200)
+    except GeminiUnavailable as exc:
+        item.analysis_error = str(exc)
         return None
 
+    parsed = _gemini_json(raw)
+    if not parsed or not ANALYSIS_KEYS.issubset(parsed.keys()):
+        missing = ANALYSIS_KEYS - set(parsed.keys()) if parsed else ANALYSIS_KEYS
+        item.analysis_error = f"Analysis JSON incomplete. Missing: {sorted(missing)}"
+        return None
 
-model_manager: Optional[GeminiModelManager] = None
+    # Normalize enums
+    decision_raw = str(parsed["decision"]).upper()
+    if decision_raw not in ALLOWED_DECISIONS:
+        item.analysis_error = f"Invalid decision: {decision_raw}"
+        return None
+    sensitivity_raw = str(parsed.get("sensitivity", "LOW")).upper()
+    confidence_raw = str(parsed.get("confidence", "LOW")).upper()
+    sensitivity = (sensitivity_raw if sensitivity_raw in
+                   {s.value for s in Sensitivity} else "MEDIUM")
+    confidence = (confidence_raw if confidence_raw in
+                  {c.value for c in Confidence} else "LOW")
+
+    scores = {k: _bounded_score(parsed.get(k, 0)) for k in (
+        "book_alignment_score", "contextual_relevance_score",
+        "engagement_score", "audience_alignment_score",
+        "promotion_naturalness_score",
+    )}
+
+    # Python computes the weighted score (spec §4).
+    promotion_score = round(
+        scores["book_alignment_score"] * 0.30 +
+        scores["contextual_relevance_score"] * 0.25 +
+        scores["engagement_score"] * 0.20 +
+        scores["audience_alignment_score"] * 0.15 +
+        scores["promotion_naturalness_score"] * 0.10
+    )
+
+    decision = decision_raw
+    rejection = ""
+
+    # Deterministic guardrails (spec §5, §13).
+    if sensitivity == "HIGH":
+        if decision != "C_SENSITIVE":
+            rejection = f"HIGH sensitivity override: {decision} → C_SENSITIVE."
+        decision = "C_SENSITIVE"
+    elif actual_chars < MIN_CONTEXT_CHARS:
+        if decision != "D_SKIP":
+            rejection = f"Context too short ({actual_chars}<{MIN_CONTEXT_CHARS}) → D_SKIP."
+        decision = "D_SKIP"
+        confidence = "LOW"
+    elif confidence == "LOW":
+        if decision != "D_SKIP":
+            rejection = "LOW confidence → D_SKIP."
+        decision = "D_SKIP"
+    elif decision == "A_PROMOTE" and promotion_score < PROMOTION_THRESHOLD:
+        new = "B_ENGAGE" if promotion_score >= ENGAGEMENT_THRESHOLD else "D_SKIP"
+        rejection = f"A_PROMOTE below threshold ({promotion_score}) → {new}."
+        decision = new
+    elif decision == "B_ENGAGE" and promotion_score < ENGAGEMENT_THRESHOLD:
+        rejection = f"B_ENGAGE below threshold ({promotion_score}) → D_SKIP."
+        decision = "D_SKIP"
+
+    return {
+        "decision": decision,
+        "decision_reason": clean_text(str(parsed.get("decision_reason", ""))),
+        "context_summary": clean_text(str(parsed.get("context_summary", ""))),
+        "sensitivity": sensitivity,
+        "sensitivity_reason": clean_text(str(parsed.get("sensitivity_reason", ""))),
+        "confidence": confidence,
+        "book_theme": clean_text(str(parsed.get("book_theme", ""))),
+        "promotion_justification": clean_text(
+            str(parsed.get("promotion_justification", ""))),
+        "promotion_score": promotion_score,
+        "guardrail_override": rejection,
+        **scores,
+    }
 
 
-def _word_range(platform: str) -> tuple:
-    if SHORT_FORM_WORDS and platform in SHORT_FORM_PLATFORMS:
-        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", SHORT_FORM_WORDS)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    return 70, 90
+# ---------------------------------------------------------------------------
+# Stage 2: Drafting (conditional)
+# ---------------------------------------------------------------------------
+_PROMO_BANNED = re.compile(
+    r"games\s+for\s+gravitas|shiralkar|amazon\.|amzn\.|buy\s+now|"
+    r"order\s+(the\s+)?book|purchase|https?://",
+    re.I,
+)
+
+_BOOK_CANON_MD = f'[**"{BOOK_TITLE}"**]({BOOK_URL})'
+_BOOK_CANON_PLAIN = f'"{BOOK_NAME_YOUTUBE}"'
 
 
-def _book_ref_instruction(plain: bool) -> str:
+def _enforce_book_format(text: str, plain: bool) -> str:
     if plain:
-        return ("PLAIN TEXT ONLY. No markdown, no bold, no links. Emphasise at most a phrase or two "
-                "with _underscores_. There must be NO hyperlink and NO URL anywhere. Name the book as plain "
-                f'text inside straight double quotation marks, written exactly like this: "{BOOK_NAME_YOUTUBE}"')
-    return ("Use markdown: put **bold** around 1-2 key phrases (not the book). Write the book exactly like this, "
-            f'bold, inside straight double quotation marks, and as a link: [**"{BOOK_NAME}"**]({BOOK_LINK}) . '
-            "Use *single asterisks* for any other italics.")
-
-
-def enforce_book_format(text: str, plain: bool) -> str:
-    """Whatever Gemini wrote, make the book name appear exactly once in the house style:
-    plain platforms  -> "Full Plain Name"           (quotes, no link)
-    markdown platforms -> [**"Games for Gravitas"**](BOOK_LINK)  (bold, quoted, linked)"""
-    bare = re.compile(r'[*_"\u201c\u201d]{0,3}Games for Gravitas[*_"\u201c\u201d]{0,3}', re.I)
-    if plain:
-        full = f'"{BOOK_NAME_YOUTUBE}"'
-        pat = re.compile(r'["\u201c\u201d]?' + re.escape(BOOK_NAME_YOUTUBE) + r'["\u201c\u201d]?', re.I)
-        if pat.search(text):
-            return pat.sub(lambda m: full, text, count=1)
-        return bare.sub(lambda m: full, text, count=1)
-    canon = f'[**"{BOOK_NAME}"**]({BOOK_LINK})'
-    link_pat = re.compile(r'\*{0,2}\[[^\]]*Games for Gravitas[^\]]*\]\([^)]*\)\*{0,2}', re.I)
+        pat = re.compile(r'["“”]?' + re.escape(BOOK_NAME_YOUTUBE) + r'["“”]?', re.I)
+        return pat.sub(lambda _m: _BOOK_CANON_PLAIN, text, count=1)
+    link_pat = re.compile(
+        r'\*{0,2}\[[^\]]*Games for Gravitas[^\]]*\]\([^)]*\)\*{0,2}', re.I)
     if link_pat.search(text):
-        return link_pat.sub(lambda m: canon, text, count=1)
-    return bare.sub(lambda m: canon, text, count=1)
+        return link_pat.sub(lambda _m: _BOOK_CANON_MD, text, count=1)
+    bare = re.compile(r'[*_"“”]{0,3}Games for Gravitas[*_"“”]{0,3}', re.I)
+    return bare.sub(lambda _m: _BOOK_CANON_MD, text, count=1)
 
 
-def build_fallback_comment(item: ContentItem, topic: str, plain: bool) -> str:
-    book = f'"{BOOK_NAME_YOUTUBE}"' if plain else f'[**"{BOOK_NAME}"**]({BOOK_LINK})'
-    templates = [
-        "This raises a real question about {t}: humans paired with AI out-think either one alone. That centaur idea sits at the heart of {b}, where leaders learn to split the work between machine speed and human judgment. What would change in your team if you practised that split deliberately?",
-        "This raises a real question about {t}: do leaders ever get to rehearse the hard calls before they arrive? In {b} I argue that structured games are a safe way to practise high-stakes decisions. Where do you see leaders getting that kind of practice today?",
-        "This raises a real question about {t}: knowing a framework is not the same as using it under pressure. {b} is built as a playbook of modular exercises leaders apply, not theory they read. Which part of your own practice would you turn into an exercise first?",
-        "This raises a real question about {t}: as AI takes over routine analysis, judgment, empathy and ethics become the scarce skills. {b} treats those non-automatable skills as the core of human advantage. Which of them is hardest to build in your experience?",
-        "This raises a real question about {t}: AI is becoming a strategic collaborator, not just a tool. {b} explores how humans and AI co-evolve in the hybrid intelligence era. How are you changing the way you work with it?",
-        "This raises a real question about {t}: blended human-AI teams need structure to work. {b} lays out a 7-Phase Model for exactly that kind of teaming. What has been the hardest handoff between people and AI in your teams?",
-    ]
-    idx = int(hashlib.md5(item.url.encode()).hexdigest(), 16) % len(BOOK_THEMES)  # invariant 5
-    return templates[idx].format(t=topic, b=book)
+def _book_mention_count(text: str) -> int:
+    return text.lower().count(BOOK_TITLE.lower())
 
 
-def generate_comment_with_gemini(item: ContentItem) -> str:
-    global model_manager
-    if model_manager is None:
-        model_manager = GeminiModelManager(GEMINI_API_KEY or "")
-        model_manager.get_working_model()
+def _validate_promote(text: str, plain: bool) -> tuple[bool, str]:
+    n = _book_mention_count(text)
+    if n == 0:
+        return False, "A_PROMOTE draft omits the book title."
+    if n > 1:
+        return False, f"A_PROMOTE draft mentions the book {n} times (must be exactly 1)."
+    return True, ""
 
-    plain = item.platform in PLAIN_TEXT_PLATFORMS  # invariant 9: key off item.platform
-    book_label = BOOK_NAME_YOUTUBE if plain else BOOK_NAME
-    book_full = BOOK_NAME_YOUTUBE if plain else BOOK_FULL_TITLE
-    topic = item.title.split("|")[0].strip() or truncate_at_boundary(item.title, 60)
-    topic = truncate_at_boundary(topic, 60)
+
+def _validate_engage(text: str) -> tuple[bool, str]:
+    if _PROMO_BANNED.search(text):
+        return False, "B_ENGAGE draft contains book/author/purchase/URL reference."
+    return True, ""
+
+
+def generate_drafts(client: GeminiClient, item: ContentItem) -> None:
+    """Stage 2: populate item.comment / item.alternatives, or leave empty."""
+    if item.decision not in (Decision.A_PROMOTE, Decision.B_ENGAGE):
+        return
+
+    plain = item.platform in PLAIN_TEXT_PLATFORMS
     lo, hi = _word_range(item.platform)
-    themes = "\n".join(f"{i}. {t['name']} - {t['detail']}" for i, t in enumerate(BOOK_THEMES, 1))
+    context = item.content_for_analysis
 
-    prompt = f"""You are {AUTHOR_NAME}, author of the book "{book_full}". Write ONE genuine comment you would post on the item below, in your own first-person voice.
+    if item.decision == Decision.A_PROMOTE:
+        prompt_name = "v3_draft_promote.md"
+        validator = lambda t: _validate_promote(t, plain)  # noqa: E731
+    else:
+        prompt_name = "v3_draft_engage.md"
+        validator = _validate_engage  # type: ignore[assignment]
 
-POST
-Platform: {item.platform}
-Title: {item.title}
-Source: {item.source}
-Snippet: {item.snippet or '(none)'}
+    book_instruction = (
+        "Mention the book exactly once. Use markdown link "
+        f"{_BOOK_CANON_MD}." if not plain else
+        f'Mention the book exactly once as {_BOOK_CANON_PLAIN} in plain text.'
+    ) if item.decision == Decision.A_PROMOTE else (
+        "Do NOT mention the book, the author, Amazon, any URL, or any "
+        "product or service. This must be a standalone contribution.")
 
-BOOK THEMES (choose exactly ONE, the single most relevant to THIS post; never stack themes):
-{themes}
+    prompt = _load_prompt(prompt_name).format(
+        platform=item.platform,
+        title=item.title,
+        decision=item.decision.value,
+        decision_reason=item.decision_reason,
+        book_theme=item.book_theme or "(none — do not force one)",
+        context=context,
+        word_lo=lo,
+        word_hi=hi,
+        book_instruction=book_instruction,
+    )
 
-RULES
-- {lo}-{hi} words, one paragraph, warm and peer-to-peer. No hype, no emojis, no hashtags, no "great post".
-- Sentence 1 must respond to a specific idea from the post's title or snippet. Show you read it.
-- Then connect that idea to your chosen theme with a cause-and-effect bridge (an insight, not a pitch), explained in fresh words.
-- Mention the book "{book_label}" exactly once, naturally, as the source of the idea.
-- Optional: end with one short question that invites replies. No canned closing line.
-- Never attribute claims to the post's author that the title/snippet do not support. If the snippet is thin, stay with the title's idea.
-- Write short, complete statements. Every sentence must end with . ! or ? (no semicolon chains): each sentence is shown on its own line.
-- Do not wrap the comment in quotation marks.
+    try:
+        raw = client.generate(prompt, max_tokens=2600)
+    except GeminiUnavailable as exc:
+        item.rejection_reason = f"Draft generation failed: {exc}"
+        return
 
-FORMAT: {_book_ref_instruction(plain)}
+    parsed = _gemini_json(raw)
+    if not parsed:
+        item.rejection_reason = "Draft JSON could not be parsed."
+        return
 
-Output ONLY the comment text."""
+    recommended = clean_text(str(parsed.get("recommended", "")))
+    alternatives = parsed.get("alternatives", [])
+    if not isinstance(alternatives, list):
+        alternatives = []
+    candidates = [recommended] + [
+        clean_text(str(a)) for a in alternatives if str(a).strip()
+    ]
+    candidates = [c for c in candidates if len(c) >= 30]
 
-    draft = ""
-    budget = 500
-    for _ in range(4):  # invariant 2: escalating budget
-        res = model_manager.generate_content(prompt, max_tokens=budget)
-        if res and len(res["text"]) > 50 and not res["truncated"]:  # invariant 3
-            draft = res["text"]
-            break
-        if res is None:
-            break  # HTTP-level failure (already retried); a bigger token budget will not help
-        if res:
-            logging.warning("Comment truncated/empty (finishReason=%s); retrying with a larger budget",
-                            res["finish_reason"])
-        budget = min(budget * 2, 4000)
-
-    if draft and BOOK_NAME.lower() not in draft.lower():  # invariant 4
-        revision = (f"Here is a draft comment:\n\n{draft}\n\nRevise it so it naturally mentions the book "
-                    f"\"{book_label}\" exactly once, keeping the same length, voice and format. "
-                    f"{_book_ref_instruction(plain)}\nOutput ONLY the revised comment.")
-        res = model_manager.generate_content(revision, max_tokens=2000)
-        if res and not res["truncated"] and BOOK_NAME.lower() in res["text"].lower():
-            draft = res["text"]
-        else:
-            draft = ""
-
-    if not draft:
-        logging.warning("Using fallback comment for %s", item.url)
-        return build_fallback_comment(item, topic, plain)
-
-    draft = draft.strip().strip('"\u201c\u201d').strip()
-    draft = re.sub(r"\s*\n+\s*", " ", draft)  # canonical single-line form
-    if plain:  # invariant 13: no hyperlink on YouTube / Shorts, even if Gemini adds one
-        draft = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", draft)
-        draft = re.sub(r"https?://\S+", "", draft)
-        draft = draft.replace("**", "").replace("*", "")
-        draft = re.sub(r"\s{2,}", " ", draft).strip()
-    draft = enforce_book_format(draft, plain)  # v2.3: bold + "quotes" (markdown) / "quotes" (plain)
-    return ensure_complete_sentence(draft)
-
-# ----------------------------------------------------------------------------
-# Processing
-# ----------------------------------------------------------------------------
-def process_content(items: List[ContentItem]) -> Digest:
-    today = datetime.now().strftime("%Y-%m-%d")
-    history = load_history(today)
-    seen, unique, repeats = set(), [], 0
-    for it in items:
-        k = _url_key(it.url)
-        if k in seen:
+    kept: list[str] = []
+    rejects: list[str] = []
+    for candidate in candidates:
+        ok, why = validator(candidate)
+        if not ok:
+            rejects.append(why)
             continue
-        seen.add(k)
-        if k in history:
+        if item.decision == Decision.A_PROMOTE:
+            candidate = _enforce_book_format(candidate, plain)
+        kept.append(candidate)
+
+    if rejects:
+        item.rejection_reason = "Rejected drafts: " + "; ".join(rejects)
+    if not kept:
+        return
+    item.comment = kept[0]
+    item.alternatives = kept[1:3]
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def dedupe_and_filter(items: list[ContentItem],
+                      history: set[str]) -> list[ContentItem]:
+    seen: set[str] = set()
+    out: list[ContentItem] = []
+    repeats = 0
+    for it in items:
+        key = normalize_url(it.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in history:
             repeats += 1
             continue
-        unique.append(it)
+        out.append(it)
     if repeats:
-        logging.info("Skipped %d post(s) already shown on earlier days", repeats)
-    for it in unique:
-        it.relevance_score = calculate_relevance_score(it)
+        log.info("Skipped %d URL(s) already in history", repeats)
+    return out
 
-    selected: List[ContentItem] = []
+
+def select_candidates(items: list[ContentItem]) -> list[ContentItem]:
+    """Keyword-screen per platform. NO weak-match backfill (spec §8)."""
+    selected: list[ContentItem] = []
     for platform in PLATFORM_ORDER:
-        pool = sorted((i for i in unique if i.platform == platform),
-                      key=lambda i: i.relevance_score, reverse=True)
-        chosen = [i for i in pool if i.relevance_score >= RELEVANCE_THRESHOLD][:MAX_RESULTS_PER_SOURCE]
-        misses = [i for i in pool if i.relevance_score < RELEVANCE_THRESHOLD]
-        if misses:
-            logging.info("%s near-misses: %s", platform,
-                         "; ".join(f"{i.relevance_score:.2f} {truncate_at_boundary(i.title, 50)}" for i in misses[:15]))
-        if len(chosen) < MIN_ITEMS_PER_PLATFORM:
-            need = MIN_ITEMS_PER_PLATFORM - len(chosen)
-            fill = [i for i in misses if i.relevance_score > 0][:need]
-            for i in fill:
-                i.backfilled = True
-                logging.info("Backfilled %s: %.2f %s", platform, i.relevance_score, i.title)
-            chosen += fill
-        if len(chosen) < MIN_ITEMS_PER_PLATFORM:
-            logging.warning("%s has only %d item(s) (target %d).", platform, len(chosen), MIN_ITEMS_PER_PLATFORM)
+        pool = [i for i in items if i.platform == platform]
+        for i in pool:
+            i.relevance_score = calculate_relevance_score(i)
+        pool.sort(key=lambda i: i.relevance_score, reverse=True)
+        chosen = [i for i in pool
+                  if i.relevance_score >= RELEVANCE_THRESHOLD][:MAX_RESULTS_PER_SOURCE]
+        if not chosen and pool:
+            log.info("%s: 0 candidates passed threshold; no backfill.", platform)
         selected.extend(chosen)
-    logging.info("Filtered to %d relevant items", len(selected))
+    return selected
 
-    for n, it in enumerate(selected, 1):
-        if not it.comment or len(it.comment) < 30:
-            logging.info("[%d/%d] Commenting on %s: %s", n, len(selected), it.platform, truncate_at_boundary(it.title, 60))
-            it.comment = generate_comment_with_gemini(it)
+
+def run_digest(raw_items: list[ContentItem],
+               *, out_dir: Path = Path(".")) -> Digest:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    history = load_history()
+    unique = dedupe_and_filter(raw_items, history)
+    selected = select_candidates(unique)
+
+    log.info("Analysing %d candidate(s) with Gemini", len(selected))
+
+    try:
+        client = GeminiClient(GEMINI_API_KEY, GEMINI_MODEL)
+    except GeminiUnavailable as exc:
+        log.error("Gemini unavailable: %s — all items will be D_SKIP.", exc)
+        client = None  # type: ignore[assignment]
+
+    for n, item in enumerate(selected, 1):
+        log.info("[%d/%d] %s — %s", n, len(selected), item.platform,
+                 truncate_at_boundary(item.title, 60))
+
+        if client is None:
+            item.decision = Decision.D_SKIP
+            item.decision_reason = "Gemini unavailable; fail-closed."
+            item.analysis_error = "Gemini unavailable."
+            continue
+
+        analysis = analyse_post(client, item)
+        if analysis is None:
+            item.decision = Decision.D_SKIP
+            item.decision_reason = item.analysis_error or "Analysis failed."
+            item.confidence = Confidence.LOW
             time.sleep(GEMINI_DELAY_SECONDS)
+            continue
 
-    grouped: Dict[str, List[ContentItem]] = {}
-    for p in PLATFORM_ORDER:
-        group = [i for i in selected if i.platform == p]
+        item.decision = Decision(analysis["decision"])
+        item.decision_reason = analysis["decision_reason"]
+        item.context_summary = analysis["context_summary"]
+        item.sensitivity = Sensitivity(analysis["sensitivity"])
+        item.sensitivity_reason = analysis["sensitivity_reason"]
+        item.confidence = Confidence(analysis["confidence"])
+        item.book_theme = analysis["book_theme"]
+        item.promotion_justification = analysis["promotion_justification"]
+        item.book_alignment_score = analysis["book_alignment_score"]
+        item.contextual_relevance_score = analysis["contextual_relevance_score"]
+        item.engagement_score = analysis["engagement_score"]
+        item.audience_alignment_score = analysis["audience_alignment_score"]
+        item.promotion_naturalness_score = analysis["promotion_naturalness_score"]
+        item.promotion_score = analysis["promotion_score"]
+
+        if analysis.get("guardrail_override"):
+            item.rejection_reason = analysis["guardrail_override"]
+
+        if item.decision in (Decision.A_PROMOTE, Decision.B_ENGAGE):
+            time.sleep(GEMINI_DELAY_SECONDS)
+            generate_drafts(client, item)
+
+        time.sleep(GEMINI_DELAY_SECONDS)
+
+    grouped: dict[str, list[ContentItem]] = {}
+    for platform in PLATFORM_ORDER:
+        group = [i for i in selected if i.platform == platform]
         if group:
             group.sort(key=lambda i: _parse_date(i.published), reverse=True)
-            grouped[p] = group
-    counts = ", ".join(f"{PLATFORM_LABEL.get(p, p)} {len(v)}" for p, v in grouped.items())
-    summary = f"{len(selected)} items worth a comment today ({counts})." if selected else "No relevant items found today."
-    return Digest(datetime.now().strftime("%Y-%m-%d"), len(selected), grouped, summary,
-                  datetime.now().isoformat(timespec="seconds"))
+            grouped[platform] = group
 
-# ----------------------------------------------------------------------------
-# Writers
-# ----------------------------------------------------------------------------
+    counts = {d.value: sum(1 for i in selected if i.decision == d)
+              for d in Decision}
+    summary = (
+        f"{len(selected)} candidate(s) assessed: "
+        f"{counts['A_PROMOTE']} promote · {counts['B_ENGAGE']} engage (no promotion) · "
+        f"{counts['C_SENSITIVE']} sensitive/abstain · {counts['D_SKIP']} skip."
+        if selected else "No candidates passed discovery filter.")
+
+    digest = Digest(
+        date=datetime.now().strftime("%Y-%m-%d"),
+        total_items=len(selected),
+        items_by_platform=grouped,
+        summary=summary,
+        generated_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    write_html(digest, out_dir / f"digest_{stamp}.html")
+    write_markdown(digest, out_dir / f"digest_{stamp}.md")
+    write_json(digest, out_dir / f"digest_{stamp}.json")
+
+    save_history(i.url for i in selected)
+    log.info("Digest written to %s", out_dir.resolve())
+    return digest
+
+
+# ---------------------------------------------------------------------------
+# Exporters
+# ---------------------------------------------------------------------------
+def _item_to_dict(it: ContentItem) -> dict[str, Any]:
+    d = asdict(it)
+    d["decision"] = it.decision.value
+    d["sensitivity"] = it.sensitivity.value
+    d["confidence"] = it.confidence.value
+    return d
+
+
 def write_json(digest: Digest, path: Path) -> None:
-    data = digest.to_dict()
-    data["metadata"] = {"version": VERSION, "exported_at": datetime.now().isoformat(timespec="seconds"),
-                        "total_items": digest.total_items, "book_name": BOOK_FULL_TITLE,
-                        "book_link": BOOK_LINK}
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload = {
+        "version": digest.version,
+        "prompt_version": digest.prompt_version,
+        "date": digest.date,
+        "generated_at": digest.generated_at,
+        "summary": digest.summary,
+        "total_items": digest.total_items,
+        "items": [
+            {"platform": p, **_item_to_dict(it)}
+            for p, group in digest.items_by_platform.items()
+            for it in group
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
 
 
 def write_markdown(digest: Digest, path: Path) -> None:
-    lines = ["# Leadership AI Daily Digest", f"**Date:** {digest.date}",
-             f"**Total Items:** {digest.total_items}", "---", "## Summary", digest.summary, ""]
-    for platform, its in digest.items_by_platform.items():
+    lines = [
+        f"# Leadership AI Daily Digest — {digest.date}",
+        f"**Version:** {digest.version} · **Prompt:** {digest.prompt_version}",
+        f"**Generated:** {digest.generated_at}",
+        "",
+        "## Summary", digest.summary, "",
+        "> Drafts are suggestions. Read the source, check the facts, edit before publishing.", "",
+    ]
+    for platform, items in digest.items_by_platform.items():
         lines.append(f"## {PLATFORM_LABEL.get(platform, platform)}")
-        for n, it in enumerate(its, 1):
-            lines += [f"### {n}. [{it.title}]({it.url})",
-                      f"**Source:** {it.source}", f"**Published:** {it.published}",
-                      f"**Preview:** {truncate_at_boundary(it.snippet, 150)}",
-                      "**Comment:**", format_sentences_on_new_lines(it.comment), ""]
+        for n, it in enumerate(items, 1):
+            lines += [
+                f"### {n}. [{it.title}]({it.url})",
+                f"- **Source:** {it.source}",
+                f"- **Published:** {it.published}",
+                f"- **Discovery score:** {it.relevance_score:.2f}",
+                f"- **Decision:** `{it.decision.value}`",
+                f"- **Reason:** {it.decision_reason}",
+                f"- **Context:** {it.context_summary}",
+                f"- **Sensitivity:** {it.sensitivity.value} ({it.sensitivity_reason or 'n/a'})",
+                f"- **Confidence:** {it.confidence.value}",
+                f"- **Promotion score:** {it.promotion_score}/100",
+                "- **Components:** "
+                f"book {it.book_alignment_score} · context {it.contextual_relevance_score} · "
+                f"engagement {it.engagement_score} · audience {it.audience_alignment_score} · "
+                f"naturalness {it.promotion_naturalness_score}",
+            ]
+            if it.book_theme:
+                lines.append(f"- **Theme:** {it.book_theme}")
+            if it.rejection_reason:
+                lines.append(f"- **Notes:** {it.rejection_reason}")
+            lines.append("")
+            if it.comment:
+                lines += ["**Recommended draft:**", "", it.comment, ""]
+                for i, alt in enumerate(it.alternatives, 1):
+                    lines += [f"**Alternative {i}:**", "", alt, ""]
+            else:
+                lines += ["_No draft generated — abstain, skip, or review manually._", ""]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def comment_to_html(comment: str, plain: bool) -> str:
-    paras = []
-    for s in split_into_sentences(comment):
-        t = html.escape(s, quote=False)
-        t = re.sub(r'"([^"]+)"', "\u201c\\1\u201d", t)  # before tags are inserted
-        if plain:
-            t = re.sub(r"(^|[\s(])_([^_]+)_(?=[\s.,!?;:)]|$)", r"\1<em>\2</em>", t)
-        else:
-            t = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
-                       r'<a href="\2" target="_blank" rel="noopener">\1</a>', t)
-            t = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", t)
-            t = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", t)
-        paras.append(f"<p>{t}</p>")
-    return "".join(paras)
-
-
-# MUST stay identical to the Python splitter (invariant 7).
-COPY_BUTTON_SCRIPT = r"""
-function splitIntoSentences(text) {
-  var pieces = text.split(/(?<=[.!?])\s+(?=[A-Z0-9"'\u201C*_\[\uD835\u210E])/);
-  var abbrev = /\b([A-Za-z]\.){1,}[A-Za-z]?$/;
-  var out = [];
-  for (var i = 0; i < pieces.length; i++) {
-    if (out.length && abbrev.test(out[out.length - 1])) out[out.length - 1] += ' ' + pieces[i];
-    else out.push(pieces[i]);
-  }
-  return out.map(function (s) { return s.trim(); }).filter(Boolean);
-}
-function toUnicodeVariant(str, style) {
-  var out = '';
-  for (var ch of str) {
-    var c = ch.codePointAt(0), cp = null;
-    if (c >= 65 && c <= 90) cp = (style === 'bold' ? 0x1D400 : 0x1D434) + (c - 65);
-    else if (c >= 97 && c <= 122) {
-      if (style === 'italic' && c === 104) cp = 0x210E;
-      else cp = (style === 'bold' ? 0x1D41A : 0x1D44E) + (c - 97);
-    } else if (c >= 48 && c <= 57 && style === 'bold') cp = 0x1D7CE + (c - 48);
-    out += (cp === null) ? ch : String.fromCodePoint(cp);
-  }
-  return out;
-}
-function markdownToClipboardText(raw) {
-  var t = raw;
-  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '$1 ($2)');
-  t = t.replace(/\*\*([^*]+)\*\*/g, function (m, a) { return toUnicodeVariant(a, 'bold'); });
-  t = t.replace(/\*([^*]+)\*/g, function (m, a) { return toUnicodeVariant(a, 'italic'); });
-  t = t.replace(/(^|[\s(])_([^_]+)_(?=[\s.,!?;:)]|$)/g, function (m, p, a) { return p + toUnicodeVariant(a, 'italic'); });
-  t = t.replace(/"([^"]+)"/g, '\u201C$1\u201D');
-  return splitIntoSentences(t).join('\n\n');
-}
-function fallbackCopy(text) {
-  var ta = document.createElement('textarea');
-  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-  document.body.appendChild(ta); ta.select();
-  var ok = false;
-  try { ok = document.execCommand('copy'); } catch (e) {}
-  document.body.removeChild(ta);
-  return ok;
-}
-var ICON_OK = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
-function copyComment(btn) {
-  var text = markdownToClipboardText(btn.getAttribute('data-comment') || '');
-  if (!btn.hasAttribute('data-orig')) btn.setAttribute('data-orig', btn.innerHTML);
-  var done = function (ok) {
-    btn.classList.toggle('copied', ok);
-    btn.innerHTML = ok ? ICON_OK + '<span>Copied</span>' : '<span>Copy failed</span>';
-    clearTimeout(btn._t);
-    btn._t = setTimeout(function () {
-      btn.classList.remove('copied');
-      btn.innerHTML = btn.getAttribute('data-orig');
-    }, 1800);
-  };
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(function () { done(true); },
-      function () { done(fallbackCopy(text)); });
-  } else { done(fallbackCopy(text)); }
-}
-"""
-
-HTML_CSS = """
-:root{--bg:#f6f7f9;--card:#fff;--text:#1f2933;--muted:#667085;--line:#e4e7ec;--accent:#1d4ed8;--sum:#e8f0fe;--amber:#f59e0b;--btn:#1d4ed8;--btntext:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#101418;--card:#1a2027;--text:#e6e9ee;--muted:#9aa4b2;--line:#2b333c;--accent:#7aa2ff;--sum:#1b2a44;--btn:#3b6df0}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.55}
-.wrap{max-width:900px;margin:0 auto;padding:24px 16px 56px}
-header h1{margin:0 0 4px;font-size:1.7rem}
-header .meta{color:var(--muted);font-size:.9rem}
-.summary{background:var(--sum);border-radius:12px;padding:14px 18px;margin:18px 0 8px}
-h2{display:flex;align-items:center;gap:10px;margin:32px 0 12px;font-size:1.25rem}
-.badge{background:var(--accent);color:#fff;border-radius:999px;font-size:.75rem;padding:2px 10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:0 0 14px;transition:box-shadow .15s}
-.card:hover{box-shadow:0 4px 16px rgba(0,0,0,.08)}
-.num{color:var(--muted);font-size:.8rem}
-.card h3{margin:2px 0 4px;font-size:1.05rem}
-.card h3 a{color:var(--accent);text-decoration:none}
-.card h3 a:hover{text-decoration:underline}
-.src{color:var(--muted);font-size:.85rem}
-.snip{color:var(--muted);font-size:.9rem;margin:8px 0}
-.near{background:var(--line);border-radius:6px;font-size:.7rem;padding:1px 6px;margin-left:6px}
-.comment{border-left:4px solid var(--amber);padding:2px 0 2px 14px;margin:12px 0 10px}
-.comment p{margin:0 0 .7em}
-button.copy{display:inline-flex;align-items:center;gap:6px;background:var(--btn);color:var(--btntext);border:0;border-radius:8px;padding:5px 11px;cursor:pointer;font-size:.8rem;transition:background .15s}
-button.copy svg{width:16px;height:16px;flex:none}
-button.copy:hover{opacity:.9}
-button.copy.copied{background:#16a34a}
-footer{margin-top:40px;color:var(--muted);font-size:.9rem;text-align:center}
-footer a{color:var(--accent)}
-@media (max-width:640px){header h1{font-size:1.4rem}.card{padding:14px}}
-"""
-
-
-COPY_ICON_SVG = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
-                 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-                 '<rect x="9" y="9" width="13" height="13" rx="2"></rect>'
-                 '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>')
-
-
-def write_html(digest: Digest, path: Path) -> None:
-    esc = lambda s: html.escape(s or "", quote=True)
-    out = ["<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>",
-           "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-           f"<title>Leadership AI Digest {esc(digest.date)}</title><style>{HTML_CSS}</style></head><body><div class='wrap'>",
-           f"<header><h1>Leadership AI Daily Digest</h1><div class='meta'>{esc(digest.date)} &middot; "
-           f"{digest.total_items} items &middot; generated {esc(digest.generated_at)}</div></header>",
-           f"<div class='summary'>{esc(digest.summary)}</div>"]
-    for platform, its in digest.items_by_platform.items():
-        out.append(f"<h2><span>{PLATFORM_ICON.get(platform, '')}</span>{esc(PLATFORM_LABEL.get(platform, platform))}"
-                   f"<span class='badge'>{len(its)}</span></h2>")
-        plain = platform in PLAIN_TEXT_PLATFORMS
-        for n, it in enumerate(its, 1):
-            near = "<span class='near'>near match</span>" if it.backfilled else ""
-            out.append(
-                f"<div class='card'><div class='num'>Post {n}{near}</div>"
-                f"<h3><a href='{esc(it.url)}' target='_blank' rel='noopener'>{esc(it.title)}</a></h3>"
-                f"<div class='src'>{esc(it.source)} &middot; {esc(it.published)} &middot; score {it.relevance_score:.2f}</div>"
-                f"<div class='snip'>{esc(truncate_at_boundary(it.snippet, 220))}</div>"
-                f"<div class='comment'>{comment_to_html(it.comment, plain)}</div>"
-                f"<button type='button' class='copy' title='Copy comment' aria-label='Copy comment' onclick='copyComment(this)' "
-                f"data-comment=\"{html.escape(it.comment, quote=True)}\">{COPY_ICON_SVG}<span>Copy</span></button></div>")
-    out.append(f"<footer>Comments promote <a href='{esc(BOOK_LINK)}' target='_blank' rel='noopener'>"
-               f"{esc(BOOK_FULL_TITLE)}</a></footer></div><script>{COPY_BUTTON_SCRIPT}</script></body></html>")
-    path.write_text("".join(out), encoding="utf-8")
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-def write_outputs(digest: Digest) -> Path:
-    DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
-    stem = DESKTOP_PATH / f"leadership_digest_{digest.date}"
-    write_json(digest, Path(f"{stem}.json"))
-    write_markdown(digest, Path(f"{stem}.md"))
-    html_path = Path(f"{stem}.html")
-    write_html(digest, html_path)
-    save_history(digest)  # only after the files are written, so a crash never burns the history
-    return html_path
-
-
-async def run_once() -> None:
-    items = await fetch_all_content()
-    digest = await asyncio.to_thread(process_content, items)
-    html_path = write_outputs(digest)
-    logging.info("Digest generation complete: %s", html_path)
-    try:
-        webbrowser.open(html_path.as_uri())
-    except Exception:
-        pass
-
-
-def main() -> None:
-    """Command-line mode: python leadership_ai_digest.py [--diagnose]"""
-    if "--diagnose" in sys.argv:
-        asyncio.run(diagnose_search())
-        return
-    while True:
-        try:
-            asyncio.run(run_once())
-        except Exception:
-            logging.exception("Run failed")
-        if RUN_ONCE:
-            break
-        logging.info("Sleeping %.1f h until the next run", RUN_INTERVAL_HOURS)
-        time.sleep(RUN_INTERVAL_HOURS * 3600)
-
-
-# ----------------------------------------------------------------------------
-# Streamlit interface:  streamlit run leadership_ai_digest.py
-# ----------------------------------------------------------------------------
-async def run_digest_pipeline() -> Digest:
-    global model_manager
-    model_manager = GeminiModelManager(GEMINI_API_KEY or "")
-    await asyncio.to_thread(model_manager.get_working_model)
-    items = await fetch_all_content()
-    return await asyncio.to_thread(process_content, items)
-
-
-LAST_RESULT_FILE = Path(tempfile.gettempdir()) / "leadership_last_result.json"
-
-
-def _save_last_result(result: dict) -> None:
-    try:
-        result = dict(result, saved_at=datetime.now().isoformat(timespec="seconds"))
-        LAST_RESULT_FILE.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    except Exception as ex:
-        logging.warning("Could not save last result: %s", ex)
-
-
-def _load_last_result() -> Optional[dict]:
-    try:
-        return json.loads(LAST_RESULT_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def main_streamlit() -> None:
-    import streamlit as st
-    import streamlit.components.v1 as components
-
-    st.set_page_config(page_title="Leadership AI Daily Digest", layout="wide")
-    st.title("Leadership AI Daily Digest Generator")
-    st.caption(f"v{VERSION} - the tool drafts, you review and post.")
-
-    # Streamlit Cloud has no permanent disk: the history file lives only for the session,
-    # so it travels with YOU: upload yesterday's file, download the updated one.
-    with st.sidebar:
-        st.subheader("No-repeat history")
-        up = st.file_uploader("Upload your last seen_posts.txt (skip on the very first run)", type=["txt"])
-        st.checkbox("Ignore history this run", key="ignore_hist")
-        st.caption("Keys: put GEMINI_API_KEY, YOUTUBE_API_KEY, SEARCH_PROVIDER and its key under App settings > Secrets, never in the repo.")
-
-    if st.button("Generate Digest", type="primary"):
-        global IGNORE_HISTORY
-        IGNORE_HISTORY = bool(st.session_state.get("ignore_hist"))
-        if up is not None:
-            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-            HISTORY_FILE.write_text(up.getvalue().decode("utf-8", errors="ignore"), encoding="utf-8")
-        try:
-            with st.status("Fetching posts and writing comments (can take 8-12 minutes)...", expanded=True) as status:
-                if not GEMINI_API_KEY:
-                    st.warning("GEMINI_API_KEY is not set: template fallback comments will be used.")
-                digest = asyncio.run(run_digest_pipeline())
-                save_history(digest)
-                with tempfile.TemporaryDirectory() as tmp:
-                    stem = Path(tmp) / f"leadership_digest_{digest.date}"
-                    write_json(digest, Path(f"{stem}.json"))
-                    write_markdown(digest, Path(f"{stem}.md"))
-                    write_html(digest, Path(f"{stem}.html"))
-                    files = {ext: Path(f"{stem}.{ext}").read_text(encoding="utf-8") for ext in ("json", "md", "html")}
-                files["history"] = HISTORY_FILE.read_text(encoding="utf-8") if HISTORY_FILE.exists() else ""
-                result = {"summary": digest.summary, "date": digest.date, "files": files}
-                _save_last_result(result)  # saved BEFORE any UI call, so it survives a dropped browser session
-                st.session_state["result"] = result
-                if model_manager is not None and not model_manager.model_name:
-                    st.warning("No working Gemini model was found: comments are fallback templates. Check the key, quota or GEMINI_MODEL.")
-                status.update(label="Digest ready", state="complete")
-        except Exception as ex:
-            st.error(f"An error occurred during digest generation: {ex}")
-            st.exception(ex)
-
-    res = st.session_state.get("result")
-    if not res:
-        res = _load_last_result()
-        if not res:
-            st.info("Click Generate Digest to start.")
-            return
-        st.info(f"Showing the last saved digest ({res.get('date')}, saved {res.get('saved_at', '')}). Click Generate Digest for a new one.")
-    f, d = res["files"], res["date"]
-    st.success(res["summary"])
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Download HTML", f["html"], f"leadership_digest_{d}.html", "text/html")
-    c2.download_button("Download Markdown", f["md"], f"leadership_digest_{d}.md", "text/markdown")
-    c3.download_button("Download JSON", f["json"], f"leadership_digest_{d}.json", "application/json")
-    c4.download_button("Download seen_posts.txt", f["history"], "seen_posts.txt", "text/plain",
-                       help="Keep this file and upload it next time so posts are not repeated.")
-    # The same cards as the HTML file, including the copy icon and one sentence per line.
-    components.html(f["html"], height=1100, scrolling=True)
-
-
-def _running_in_streamlit() -> bool:
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        try:
-            return get_script_run_ctx(suppress_warning=True) is not None
-        except TypeError:
-            return get_script_run_ctx() is not None
-    except Exception:
-        return False
-
-
-if __name__ == "__main__":
-    if _running_in_streamlit():
-        main_streamlit()
-    else:
-        main()
+_HTML_CSS = """
+body{font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+background:#f5f6f8;color:#202733;margin:0}
+.wrap{max-width:1000px;margin:auto;padding:24px}
+.card{background:white;border:1px solid #dfe3e8;border-radius:10px;padding:18px;margin:16px 0}
+.meta,.muted{color:#667085;font-size:13px}
+.reason{margin:8px 0}
+.pill{display:inline-block;border-radius:20px;padding:
