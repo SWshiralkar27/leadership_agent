@@ -664,5 +664,12 @@ def main() -> None:
         return
     print("Run this app via: streamlit run Comment_generator_V2.py")
 
+try:
+    import streamlit as st
+    if st.runtime.exists():
+        main_streamlit()
+except ImportError:
+    pass
+
 if __name__ == "__main__" and "streamlit" not in sys.modules:
     main()
